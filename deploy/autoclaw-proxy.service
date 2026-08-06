@@ -1,0 +1,49 @@
+[Unit]
+Description=AutoClaw OpenAI-Compatible Proxy (Gunicorn)
+Documentation=https://github.com/autoclaw-autologin
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=notify
+NotifyAccess=all
+User=autoclaw
+Group=autoclaw
+WorkingDirectory=/opt/autoclaw-autologin
+ExecStart=/usr/bin/gunicorn -c gunicorn_config.py wsgi:app
+KillSignal=SIGQUIT
+KillMode=mixed
+
+# Environment
+EnvironmentFile=-/etc/autoclaw/env
+Environment=PYTHONUNBUFFERED=1
+Environment=AUTOCLAW_PROXY_HOST=127.0.0.1
+Environment=AUTOCLAW_PROXY_PORT=31000
+
+# Resource Limits
+MemoryMax=512M
+MemoryHigh=384M
+CPUQuota=100%
+LimitNOFILE=65536
+
+# Restart Policy
+Restart=on-failure
+RestartSec=5
+
+# Security Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log/autoclaw
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=autoclaw-proxy
+
+[Install]
+WantedBy=multi-user.target
