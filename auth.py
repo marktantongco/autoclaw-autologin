@@ -9,6 +9,8 @@ import logging
 import requests
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Synergy 6: OWL-AGENT proxy defense layer (owl-agent v5.3, hybrid backend)
+import owl_bridge
 from config import (
     APP_ID, APP_KEY, PRODUCT, VERSION, PLATFORM,
     USER_API_BASE, GOOGLE_OAUTH_URL, GOOGLE_OAUTH_LOGIN,
@@ -78,6 +80,29 @@ def _sign_headers():
         "X-Trace-Id": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
+
+
+def _upstream_request(method, url, *, headers=None, json=None, params=None,
+                      timeout=15, proxies=None):
+    """Synergy 6: route upstream calls through the OWL proxy-defense layer
+    (owl-agent v5.3) when enabled; transparent direct fallback.
+
+    Explicit `proxies` (proxies.txt round-robin used by registration flows)
+    always win — dedicated paid proxies outrank the free OWL pool; OWL only
+    engages when no explicit proxy is available (proxies is None).
+
+    Returns a requests-compatible response object (OwlResponse shim when
+    routed via OWL, requests.Response otherwise).
+    """
+    if proxies is None and owl_bridge.owl_enabled():
+        try:
+            return owl_bridge.owl_request(
+                method, url, headers=headers, json_body=json, timeout=timeout)
+        except owl_bridge.OwlUnavailable as e:
+            logger.debug(f"OWL unavailable → direct: {e}")
+    return requests.request(method, url, headers=headers, json=json,
+                            params=params, timeout=timeout, verify=False,
+                            proxies=proxies)
 
 
 def load_tokens():
@@ -215,7 +240,7 @@ def refresh_token(account):
             "device_id": account["device_id"],
             "refresh_token": account["refresh_token"],
         }
-        resp = requests.post(REFRESH_URL, json=body, headers=headers, timeout=15, verify=False)
+        resp = _upstream_request("POST", REFRESH_URL, headers=headers, json=body, timeout=15)
         data = resp.json()
 
         if data.get("code") == 0 and "data" in data:
@@ -259,7 +284,7 @@ def refresh_all():
                 "device_id": acc["device_id"],
                 "refresh_token": acc["refresh_token"],
             }
-            resp = requests.post(REFRESH_URL, json=body, headers=headers, timeout=15, verify=False)
+            resp = _upstream_request("POST", REFRESH_URL, headers=headers, json=body, timeout=15)
             resp_data = resp.json()
 
             if resp_data.get("code") == 0 and "data" in resp_data:
@@ -294,7 +319,7 @@ def check_profile(access_token):
     raw = access_token.replace("Bearer ", "")
     headers["X-Authorization"] = f"Bearer {raw}"
     try:
-        resp = requests.post(PROFILE_URL, json={}, headers=headers, timeout=15, verify=False)
+        resp = _upstream_request("POST", PROFILE_URL, headers=headers, json={}, timeout=15)
         return resp.json()
     except Exception as e:
         return {"error": str(e)}
@@ -306,7 +331,7 @@ def check_wallet(access_token):
     raw = access_token.replace("Bearer ", "")
     headers["authorization"] = f"Bearer {raw}"  # lowercase for assetmgr!
     try:
-        resp = requests.get(WALLET_URL, headers=headers, timeout=15, verify=False)
+        resp = _upstream_request("GET", WALLET_URL, headers=headers, timeout=15)
         return resp.json()
     except Exception as e:
         return {"error": str(e)}
@@ -318,7 +343,7 @@ def check_ledger(access_token):
     raw = access_token.replace("Bearer ", "")
     headers["authorization"] = f"Bearer {raw}"
     try:
-        resp = requests.get(LEDGER_URL, headers=headers, timeout=15, verify=False)
+        resp = _upstream_request("GET", LEDGER_URL, headers=headers, timeout=15)
         return resp.json()
     except Exception as e:
         return {"error": str(e)}
@@ -347,7 +372,7 @@ def google_oauth_url(device_id=None, navigate_uri="http://localhost:18432/auth/c
     last_msg = ""
     for attempt in range(max_retries):
         retries_done = attempt + 1
-        resp = requests.post(GOOGLE_OAUTH_URL, json=body, headers=headers, timeout=15, verify=False, proxies=px)
+        resp = _upstream_request("POST", GOOGLE_OAUTH_URL, headers=headers, json=body, timeout=15, proxies=px)
         try:
             data = resp.json()
         except Exception:
@@ -407,7 +432,7 @@ def google_oauth_login(code, state, device_id, navigate_uri="http://localhost:18
     # Retry on 630014 (IP rate limit) — try switching proxy
     import time as _time
     for attempt in range(3):
-        resp = requests.post(GOOGLE_OAUTH_LOGIN, json=body, headers=headers, timeout=15, verify=False, proxies=px)
+        resp = _upstream_request("POST", GOOGLE_OAUTH_LOGIN, headers=headers, json=body, timeout=15, proxies=px)
         try:
             data = resp.json()
         except Exception:

@@ -10,7 +10,7 @@ if APP_KEY == "38d2391985e2369a5fb8227d8e6cd5e5":
     import warnings
     warnings.warn("AUTOCLAW_APP_KEY not set — using default (insecure, forgeable). Set env var in production.")
 PRODUCT = "autoclaw"
-VERSION = "1.9.1"
+VERSION = "2.1.0"
 PLATFORM = "win"
 
 # ── Endpoints ──
@@ -85,6 +85,35 @@ if _os.path.exists(_PROXY_FILE):
                     "username": _user,
                     "password": _pwd,
                 })
+
+# ──────────────────────────────────────────────────────────────────────────
+# Synergy 6: OWL-AGENT Proxy Defense Layer (v5.3-autoclaw, vendored)
+# Source: OWL-AGENT v5.3 proxy_defense.py (hybrid: external install wins)
+# ──────────────────────────────────────────────────────────────────────────
+# Proxy-first upstream routing: all upstream HTTP (chat SSE, token refresh,
+# profile, wallet, ledger) races HEDGE_FANOUT free proxies in parallel for
+# connection establishment; first to deliver headers wins; losers banned
+# (single-strike, idempotent, backoff-scaled). Direct fallback always on.
+#   OWL_PROXY_ENABLED     1|0     master switch (default ON)
+#   OWL_BASE_DIR                  state dir (default ~/.owl-agent; shared
+#                                 with an external OWL-AGENT install)
+#   OWL_EXTERNAL_MODULE           path to external proxy_defense.py
+#   OWL_HEDGE_FANOUT      int     proxies raced per request (default 3)
+#   OWL_PROXY_TIMEOUT     float   per-proxy connect cap s (default 6)
+#   OWL_DIRECT_TIMEOUT    float   direct fallback connect cap s (default 30)
+#   OWL_TLS_IMPERSONATE   str     curl_cffi target, e.g. chrome110
+#                                 (requires `pip install curl_cffi`)
+#   OWL_CACHE_TTL         int     GET cache seconds; 0 disables (default 0:
+#                                 auth responses are account-specific)
+#   OWL_SEED_URL          str     proxy source list (proxifly CDN)
+#   OWL_SEED_COUNT        int     max proxies seeded per cycle (default 100)
+#   OWL_VALIDATE_URL      str     connectivity probe (default gstatic 204)
+#   OWL_STARTUP_TIMEOUT   float   seeding wait before first request (default 15)
+# Google-OAuth registration calls keep proxies.txt round-robin when set —
+# dedicated paid proxies outrank the free pool; OWL engages only when none.
+OWL_ENABLED_DEFAULT = os.environ.get("OWL_PROXY_ENABLED", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+
 
 # ── Billing Header Quirks ──
 # LLM proxy: X-Authorization (capital X)

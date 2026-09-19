@@ -203,6 +203,44 @@ autoclaw-autologin/
 └── README.md
 ```
 
+
+## 🦉 OWL-AGENT Proxy Defense Layer (v2.1.0)
+
+All upstream HTTP — chat SSE streams, token refresh, profile, wallet, ledger — is routed through an integrated **proxy-first defense stack** (OWL-AGENT v5.3, vendored as `owl_proxy.py` + `owl_bridge.py`):
+
+1. **Seed** — 100 free proxies pulled from the proxifly CDN at boot, validated in the background against a 204 endpoint
+2. **Race** — every upstream request races `OWL_HEDGE_FANOUT` (default 3) proxies in parallel for *connection establishment*; first to deliver headers carries the stream (worst case +6 s, usually sub-second)
+3. **Ban** — single-strike idempotent bans with backoff scaling (60 s × fail_count, cap 10×); quality scores (latency/success/throughput EWMA) rank the pool
+4. **Fallback** — direct connection always available: fires when the pool is empty, the race is lost, or OWL is disabled
+5. **Guardrails** — per-domain adaptive rate limiting (429 → halve rate, success → grow), per-domain circuit breakers on *network* failures only (HTTP 4xx/5xx never trip them), GET-only header-aware HTTP cache + request deduplication
+
+**Hybrid backend** (GLM_proxy cloud→local pattern): if an external OWL-AGENT install exists at `~/.owl-agent/proxy_defense.py`, it wins over the vendored module — vendored copy is the always-works fallback.
+
+### OWL environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OWL_PROXY_ENABLED` | `1` | Master switch (`0` = exact v2.0.0 behavior) |
+| `OWL_BASE_DIR` | `~/.owl-agent` | State dir (proxy cache, HTTP cache) |
+| `OWL_EXTERNAL_MODULE` | `~/.owl-agent/proxy_defense.py` | External backend path |
+| `OWL_HEDGE_FANOUT` | `3` | Proxies raced per request |
+| `OWL_PROXY_TIMEOUT` | `6` | Per-proxy connect cap (s) |
+| `OWL_DIRECT_TIMEOUT` | `30` | Direct fallback connect cap (s) |
+| `OWL_TLS_IMPERSONATE` | *(off)* | curl_cffi TLS fingerprint, e.g. `chrome110` (`pip install curl_cffi`) |
+| `OWL_CACHE_TTL` | `0` | GET cache seconds (off by default — auth responses are account-specific) |
+| `OWL_SEED_URL` / `OWL_SEED_COUNT` | proxifly / `100` | Proxy source list / seed size |
+| `OWL_VALIDATE_URL` | gstatic 204 | Connectivity probe for validation |
+| `OWL_STARTUP_TIMEOUT` | `15` | Seeding wait before first request |
+
+### Observability
+
+- Every chat response carries `X-Upstream-Via: direct` or `X-Upstream-Via: owl-proxy/<backend>`
+- `GET /health` now includes an `owl` block: `{enabled, backend, proxies_total, proxies_healthy, ...}`
+- Standalone CLI: `python owl_proxy.py stats | fetch <url> | benchmark`
+
+> Google-OAuth **registration** calls keep their `proxies.txt` round-robin when configured — dedicated paid proxies outrank the free pool; OWL engages only when no explicit proxy is set.
+
 ## License
+
 
 MIT

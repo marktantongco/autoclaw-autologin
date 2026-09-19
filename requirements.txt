@@ -2,3 +2,8 @@ flask>=3.0
 requests>=2.31
 cloakbrowser>=0.4.5
 aiohttp>=3.9
+# ── Synergy 6: OWL-AGENT proxy defense layer (owl_proxy.py / owl_bridge.py) ──
+httpx[http2]>=0.27
+aiohttp-socks>=0.9        # optional but recommended: SOCKS4/5 proxy support
+# curl_cffi>=0.7           # optional: TLS impersonation (set OWL_TLS_IMPERSONATE=chrome110)
+# pytest>=8.0              # optional: run the test suite (test_owl_integration.py)

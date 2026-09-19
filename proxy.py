@@ -17,14 +17,14 @@ import time
 import uuid
 import threading
 import logging
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response, jsonify, g
 import requests as req_lib
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from config import (
     CHAT_COMPLETIONS, MODEL_MAP, DEFAULT_MODEL,
-    PROXY_HOST, PROXY_PORT, TOKENS_FILE,
+    PROXY_HOST, PROXY_PORT, TOKENS_FILE, VERSION,
     STRICT_MODEL_VALIDATION, PROXY_API_KEY, TLS_VERIFY,
     # Synergy 1: Output-cap clamping (clampMaxOutput / OUTPUT_CAPS)
     # Synergy 2: System-banner injection (AUTOCLAW_SYSTEM_BANNER)
@@ -44,6 +44,10 @@ from cache import (
 # Synergy 4: Chinese → English error translation (ZH_ERROR_MAP)
 # Source: eequaled/GLM_proxy lib/core.js
 from i18n_errors import translate_error
+# Synergy 6: OWL-AGENT proxy defense layer (proxy-first routing, hedged
+# racing, single-strike ban, direct fallback). Hybrid backend: external
+# ~/.owl-agent install wins over the vendored owl_proxy.py.
+import owl_bridge
 
 # ─── Structured Logging ──────────────────────────────────────────────
 logger = logging.getLogger("autoclaw.proxy")
@@ -51,6 +55,17 @@ logger = logging.getLogger("autoclaw.proxy")
 TOKENS_FILE_FULL = TOKENS_FILE  # full path for backup operations
 
 app = Flask(__name__)
+
+@app.after_request
+def _owl_via_header(resp):
+    """Observability: expose which network path served the request."""
+    try:
+        via = g.get("_upstream_via")
+        if via:
+            resp.headers["X-Upstream-Via"] = via
+    except Exception:
+        pass
+    return resp
 
 # ── Pending OAuth login state (supports concurrent logins) ──
 _pending_logins = {}  # keyed by state: {state: {"device_id":..., "result":..., "error":...}}
@@ -406,18 +421,40 @@ def chat_completions():
     client_wants_stream = body.get("stream", False)
 
     try:
-        # Always request stream from upstream
-        upstream_resp = req_lib.post(
-            CHAT_COMPLETIONS,
-            json=upstream_body,
-            headers=headers,
-            stream=True,
-            timeout=600,
-            verify=False,
-        )
+        # ── Synergy 6: OWL proxy-first streaming (owl-agent v5.3) ──
+        # Race HEDGE_FANOUT free proxies for connection establishment;
+        # first to deliver headers carries the SSE stream. Direct fallback
+        # fires when OWL is disabled, unavailable, or the race is lost.
+        upstream_resp = None
+        via = "direct"
+        if owl_bridge.owl_enabled():
+            try:
+                upstream_resp = owl_bridge.owl_stream_request(
+                    "POST", CHAT_COMPLETIONS,
+                    headers=headers, json_body=upstream_body, timeout=600,
+                )
+                via = f"owl-proxy/{owl_bridge.owl_backend()}"
+                logger.info(f"Chat upstream via {via}")
+            except owl_bridge.OwlUnavailable as e:
+                logger.warning(f"OWL unavailable → direct fallback: {e}")
+                upstream_resp = None
+        g._upstream_via = via
+        if upstream_resp is None:
+            # Always request stream from upstream (direct path)
+            upstream_resp = req_lib.post(
+                CHAT_COMPLETIONS,
+                json=upstream_body,
+                headers=headers,
+                stream=True,
+                timeout=600,
+                verify=False,
+            )
 
         if upstream_resp.status_code != 200:
-            raw_error = upstream_resp.text[:1000]
+            if isinstance(upstream_resp, owl_bridge.OwlStreamResponse):
+                raw_error = upstream_resp.read_error(1000)
+            else:
+                raw_error = upstream_resp.text[:1000]
             # ── Synergy 4: Chinese → English Error Translation ──
             # Source: eequaled/GLM_proxy lib/core.js (translateError)
             # AutoClaw upstream returns Chinese error phrases (积分不足,
@@ -464,7 +501,11 @@ def chat_completions():
                             raw = line[5:].strip()
                             if raw == b"[DONE]":
                                 yield line + b"\n\n"
-                                continue
+                                # v2.1.0 fix: upstream [DONE] previously fell
+                                # through and the generator appended a SECOND
+                                # [DONE] — duplicate terminator confused some
+                                # strict OpenAI clients.
+                                return
                             try:
                                 chunk = json.loads(raw)
                                 choices = chunk.get("choices", [])
@@ -593,6 +634,9 @@ def health():
         "status": "ok",
         "accounts": len(data["accounts"]),
         "port": PROXY_PORT,
+        "version": VERSION,
+        # Synergy 6: OWL-AGENT proxy defense layer stats (never raises)
+        "owl": owl_bridge.owl_stats(),
     })
 
 
