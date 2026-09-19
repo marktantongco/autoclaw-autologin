@@ -1,10 +1,11 @@
-"""AutoClaw v2.2.0 — OWL-AGENT integration + Phase-1/Phase-2 synergy tests.
+"""AutoClaw v2.3.0 — OWL-AGENT integration + Phase-1/2/3 synergy tests.
 
 Run:  python -m pytest test_owl_integration.py -v
 
 Network policy: every test is offline. All HTTP seams (proxy racing, direct
-fallback, aiohttp/httpx/curl_cffi) are mocked; the real OWL runtime thread
-is never started (bridge layer is exercised with injected fakes).
+fallback, aiohttp/httpx/curl_cffi, WS local-agent, thermoptic proxy) are
+mocked; the real OWL runtime thread is never started (bridge layer is
+exercised with injected fakes).
 """
 
 import asyncio
@@ -28,6 +29,11 @@ from owl_bridge import OwlResponse, OwlStreamResponse, OwlUnavailable
 import chat_fingerprint
 import loop_breaker
 import dsml_shim
+
+# Phase-3 modules (Synergy 13 + 14 + 15)
+import metrics
+import ws_fallback
+import thermoptic_bridge
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -739,6 +745,11 @@ def flask_env(monkeypatch, tmp_path):
     # Phase-2 singletons must not leak across tests either
     chat_fingerprint.reset()
     loop_breaker.reset()
+    # Phase-3 singletons: metrics + backend preference + WS/thermoptic state
+    metrics.reset()
+    metrics.set_backend_pref("owl-first")
+    ws_fallback._reset_for_tests()
+    thermoptic_bridge._reset_for_tests()
     monkeypatch.setattr(proxy, "get_next_token",
                         lambda *a, **kw: ("fake-token", {"email": "t@x", "access_token": "fake-token"}))
     monkeypatch.setattr(proxy, "load_tokens", lambda: {"accounts": []})
@@ -749,6 +760,12 @@ def flask_env(monkeypatch, tmp_path):
 def client(flask_env):
     flask_env.app.config["TESTING"] = True
     return flask_env.app.test_client()
+
+
+@pytest.fixture
+def proxy_mod(flask_env):
+    """The proxy module itself (same instance `client` is bound to)."""
+    return flask_env
 
 
 SSE_BODY = (b'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n'
@@ -764,7 +781,7 @@ class TestChatRoutes:
         body = r.get_json()
         assert body["status"] == "ok"
         assert "owl" in body and body["owl"]["enabled"] is False
-        assert body["version"] == "2.2.0"
+        assert body["version"] == "2.3.0"
 
     def test_router_command_still_intercepted(self, client):
         r = client.post("/v1/chat/completions",
@@ -1456,3 +1473,478 @@ class TestPhase2Regression:
         assert r.status_code == 200
         sent = captured["json"]["messages"]
         assert _dsml_marker() in sent[0]["content"]   # upstream copy got protocol
+
+
+@pytest.fixture(autouse=True)
+def _isolate_phase3_state():
+    """Phase-3 singletons must not leak across tests (metrics totals,
+    backend pref, WS breaker/discovery caches, thermoptic breaker)."""
+    metrics.reset()
+    metrics.set_backend_pref("owl-first")
+    ws_fallback._reset_for_tests()
+    thermoptic_bridge._reset_for_tests()
+    yield
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 3 (Synergy #15) — metrics registry
+# ═══════════════════════════════════════════════════════════════════
+
+class TestMetrics:
+    def test_record_and_snapshot(self):
+        metrics.record("/v1/chat/completions", 200, via="owl-proxy/vendored",
+                       latency_ms=42.5, client_ip="10.0.0.9", model="cheap",
+                       stream=True)
+        snap = metrics.snapshot()
+        assert snap["totals"]["requests"] == 1
+        assert snap["totals"]["stream"] == 1
+        assert snap["status_codes"]["200"] == 1
+        assert snap["via"]["owl-proxy/vendored"] == 1
+        assert snap["models"]["cheap"] == 1
+        entry = snap["request_log"][-1]
+        assert entry["route"] == "/v1/chat/completions"
+        assert entry["status"] == 200 and entry["via"] == "owl-proxy/vendored"
+        assert entry["latency_ms"] == 42.5 and entry["model"] == "cheap"
+
+    def test_mask_ip_is_stable_and_privacy_safe(self):
+        m1 = metrics.mask_ip("192.168.1.44")
+        m2 = metrics.mask_ip("192.168.1.44")
+        m3 = metrics.mask_ip("192.168.1.45")
+        assert m1 == m2 and m1 != m3
+        assert "192.168" not in m1 and len(m1) == 12
+        assert metrics.mask_ip("") == "unknown"
+
+    def test_block_and_feature_counters(self):
+        metrics.record("/v1/chat/completions", 400, block="loop_breaker")
+        metrics.record("/v1/chat/completions", 200, feature="dsml_shim")
+        snap = metrics.snapshot()
+        assert snap["blocks"]["loop_breaker"] == 1
+        assert snap["totals"]["blocks"] == 1
+        assert snap["features"]["dsml_shim"] == 1
+        # clients registered even for blocked calls
+        assert snap["client_count"] >= 1
+
+    def test_request_log_ring_cap(self, monkeypatch):
+        monkeypatch.setattr(metrics, "REQUEST_LOG_CAP", 5)
+        for i in range(8):
+            metrics.record("/v1/x", 200)
+        snap = metrics.snapshot()
+        assert len(snap["request_log"]) == 5
+        # newest kept, oldest dropped
+        assert snap["request_log"][-1]["latency_ms"] >= 0
+
+    def test_backend_pref_validation(self):
+        ok, _ = metrics.set_backend_pref("thermoptic-first")
+        assert ok and metrics.backend_pref() == "thermoptic-first"
+        ok, msg = metrics.set_backend_pref("bogus")
+        assert not ok and "bogus" in msg
+        assert metrics.backend_pref() == "thermoptic-first"  # unchanged
+
+    def test_reset_clears_telemetry_keeps_control(self):
+        metrics.set_backend_pref("direct-only")
+        metrics.record("/v1/x", 200, client_ip="1.2.3.4")
+        metrics.reset()
+        snap = metrics.snapshot()
+        assert snap["totals"]["requests"] == 0
+        assert snap["request_log"] == []
+        assert snap["client_count"] == 0
+        assert snap["control"]["backend_pref"] == "direct-only"
+
+    def test_snapshot_control_shape(self):
+        snap = metrics.snapshot()
+        assert snap["control"]["backend_pref"] in metrics.VALID_BACKEND_PREFS
+        assert set(metrics.VALID_BACKEND_PREFS) == {
+            "owl-first", "thermoptic-first", "direct-only"}
+
+    def test_record_never_raises_on_garbage(self):
+        metrics.record(None, "not-a-status", via=123, latency_ms="abc",
+                       client_ip=None, model=object(), stream="yes",
+                       block=[], feature={})
+        assert metrics.snapshot()["totals"]["requests"] == 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 3 (Synergy #14) — thermoptic bridge
+# ═══════════════════════════════════════════════════════════════════
+
+class TestThermopticBridge:
+    def test_disabled_by_default(self):
+        # sandbox/test env never sets OWL_THERMOPTIC_ENABLED
+        assert thermoptic_bridge.enabled() is False
+        assert thermoptic_bridge.healthy() is False
+
+    def test_proxy_url_auth_and_proxies_dict(self, monkeypatch):
+        monkeypatch.setattr(thermoptic_bridge, "BASE_URL", "http://127.0.0.1:1234")
+        monkeypatch.setattr(thermoptic_bridge, "USERNAME", "op")
+        monkeypatch.setattr(thermoptic_bridge, "PASSWORD", "s3cr3t")
+        url = thermoptic_bridge.proxy_url()
+        assert url.startswith("http://op:") and "127.0.0.1:1234" in url
+        px = thermoptic_bridge.requests_proxies()
+        assert px == {"http": url, "https": url}
+
+    def test_verify_prefers_ca_file(self, monkeypatch, tmp_path):
+        ca = tmp_path / "rootCA.crt"
+        ca.write_text("-----BEGIN CERTIFICATE-----\nX\n-----END CERTIFICATE-----")
+        monkeypatch.setattr(thermoptic_bridge, "CA_FILE", str(ca))
+        assert thermoptic_bridge.verify() == str(ca)
+        monkeypatch.setattr(thermoptic_bridge, "CA_FILE",
+                            str(tmp_path / "missing.crt"))
+        assert thermoptic_bridge.verify() is False
+
+    def test_probe_negative_cache(self, monkeypatch):
+        calls = {"n": 0}
+        def fake_probe(timeout=None):
+            calls["n"] += 1
+            return False, "connect refused"
+        monkeypatch.setattr(thermoptic_bridge, "_probe_once", fake_probe)
+        with thermoptic_bridge._probe_lock:
+            thermoptic_bridge._probe_cache.update(
+                {"ok_until": 0.0, "bad_until": 0.0})
+        assert thermoptic_bridge.probe() is False
+        assert thermoptic_bridge.probe() is False  # served from negative cache
+        assert calls["n"] == 1
+
+    def test_transport_failure_trips_breaker(self, monkeypatch):
+        import requests as req_lib
+        monkeypatch.setattr(thermoptic_bridge, "ENV_ENABLED", True)
+        monkeypatch.setattr(thermoptic_bridge, "BREAKER_THRESHOLD", 2)
+        def boom(*a, **kw):
+            raise req_lib.exceptions.ConnectionError("proxy down")
+        monkeypatch.setattr(req_lib, "request", boom)
+        with pytest.raises(thermoptic_bridge.ThermopticUnavailable):
+            thermoptic_bridge.http_request("GET", "https://x.test")
+        assert not thermoptic_bridge.breaker_open()
+        with pytest.raises(thermoptic_bridge.ThermopticUnavailable):
+            thermoptic_bridge.http_request("GET", "https://x.test")
+        assert thermoptic_bridge.breaker_open()  # threshold 2 reached
+        with pytest.raises(thermoptic_bridge.ThermopticUnavailable):
+            thermoptic_bridge.http_request("GET", "https://x.test")  # breaker path
+
+    def test_upstream_http_error_is_not_a_transport_failure(self, monkeypatch):
+        import requests as req_lib
+        monkeypatch.setattr(thermoptic_bridge, "ENV_ENABLED", True)
+        class FakeResp:
+            status_code = 401
+            text = '{"error": "auth"}'
+        monkeypatch.setattr(req_lib, "request", lambda *a, **kw: FakeResp())
+        before = thermoptic_bridge.stats()["consecutive_failures"]
+        resp = thermoptic_bridge.http_request("POST", "https://x.test")
+        assert resp.status_code == 401  # passes through verbatim
+        assert thermoptic_bridge.stats()["consecutive_failures"] == before
+
+    def test_stats_shape(self):
+        s = thermoptic_bridge.stats()
+        for key in ("enabled", "url", "source", "breaker_open",
+                    "requests_served", "healthy"):
+            assert key in s
+        assert "mandatoryprogrammer/thermoptic" in s["source"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 3 (Synergy #13) — WS local-agent fallback
+# ═══════════════════════════════════════════════════════════════════
+
+class FakeWsAgent:
+    """Scripted local-agent: replays queued frames per recv(), records sends."""
+    def __init__(self, frames):
+        self._frames = list(frames)
+        self.sent = []
+        self.closed = False
+        self.timeout_set = None
+
+    def settimeout(self, t):
+        self.timeout_set = t
+
+    def send(self, raw):
+        self.sent.append(raw)
+
+    def recv(self):
+        if not self._frames:
+            raise ConnectionError("agent went away")
+        return self._frames.pop(0)
+
+    def close(self):
+        self.closed = True
+
+
+def _agent_frames(sse_chunks, status=200):
+    """Build protocol-v1 frame sequence for the given SSE chunks."""
+    def f(d):
+        return json.dumps(d)
+    frames = [f({"type": "chat.headers", "status": status})]
+    for c in sse_chunks:
+        frames.append(f({"type": "chat.delta", "sse": c}))
+    frames.append(f({"type": "chat.end"}))
+    return frames
+
+
+class TestWsFallback:
+    def test_disabled_by_default(self):
+        assert ws_fallback.enabled() is False
+
+    def test_shim_iter_lines_requests_semantics(self):
+        chunks = [b'data: {"a":1}\n\nda', b'ta: {"b":2}\n\ndata: [DONE]\n\n']
+        resp = ws_fallback.WsStreamResponse(200, {}, frame_iter=iter(chunks))
+        lines = list(resp.iter_lines())
+        assert lines == [
+            b'data: {"a":1}', b"", b'data: {"b":2}', b"", b"data: [DONE]", b""]
+
+    def test_discovery_prefers_configured_url(self, monkeypatch):
+        monkeypatch.setattr(ws_fallback, "AGENT_URL", "ws://10.1.2.3:9999/agent")
+        monkeypatch.setattr(ws_fallback, "_ping_probe", lambda url, timeout=2.0: True)
+        assert ws_fallback.discover_agent(force=True) == "ws://10.1.2.3:9999/agent"
+
+    def test_discovery_negative_cache(self, monkeypatch):
+        calls = {"n": 0}
+        def fail(url, timeout=2.0):
+            calls["n"] += 1
+            return False
+        monkeypatch.setattr(ws_fallback, "_ping_probe", fail)
+        monkeypatch.setattr(ws_fallback, "AGENT_URL", "")
+        assert ws_fallback.discover_agent(force=True) is None
+        assert ws_fallback.discover_agent() is None  # negative cache
+        assert calls["n"] == len(ws_fallback.DISCOVERY_PORTS)
+
+    def test_chat_stream_happy_path(self, monkeypatch):
+        agent = FakeWsAgent(_agent_frames([
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}\n\n',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+            "data: [DONE]\n\n"]))
+        monkeypatch.setattr(ws_fallback, "ENV_ENABLED", True)
+        monkeypatch.setattr(ws_fallback, "AGENT_URL", "ws://agent.test/agent")
+        monkeypatch.setattr(ws_fallback, "_connect", lambda url, t: agent)
+        monkeypatch.setattr(ws_fallback, "_ping_probe", lambda *a, **kw: True)
+        resp = ws_fallback.chat_stream({"messages": [{"role": "user", "content": "x"}]},
+                                       timeout=30)
+        assert resp.status_code == 200
+        req = json.loads(agent.sent[0])
+        assert req["type"] == "chat.request" and req["protocol"] == "autoclaw-ws-agent-v1"
+        assert req["payload"]["messages"][0]["content"] == "x"
+        lines = list(resp.iter_lines())
+        assert b'"content":"Hi"' in lines[0] or b'"content": "Hi"' in lines[0]
+        assert b"data: [DONE]" in lines
+        assert agent.closed  # closed when the stream drains
+        assert ws_fallback.stats()["requests_served"] == 1
+
+    def test_agent_error_envelope_does_not_trip_breaker(self, monkeypatch):
+        def f(d):
+            return json.dumps(d)
+        agent = FakeWsAgent([f({"type": "chat.headers", "status": 503}),
+                             f({"type": "chat.error", "status": 503,
+                                "message": "agent upstream dead"})])
+        monkeypatch.setattr(ws_fallback, "ENV_ENABLED", True)
+        monkeypatch.setattr(ws_fallback, "ENV_ENABLED", True)
+        monkeypatch.setattr(ws_fallback, "AGENT_URL", "ws://agent.test/agent")
+        monkeypatch.setattr(ws_fallback, "_connect", lambda url, t: agent)
+        monkeypatch.setattr(ws_fallback, "_ping_probe", lambda *a, **kw: True)
+        resp = ws_fallback.chat_stream({"messages": []}, timeout=30)
+        assert resp.status_code == 503
+        assert "agent upstream dead" in resp.read_error(200)
+        list(resp.iter_lines())  # drain
+        stats = ws_fallback.stats()
+        assert stats["consecutive_failures"] == 0  # transport was fine
+        assert stats["requests_served"] == 1
+
+    def test_connect_failures_trip_breaker(self, monkeypatch):
+        monkeypatch.setattr(ws_fallback, "ENV_ENABLED", True)
+        monkeypatch.setattr(ws_fallback, "BREAKER_THRESHOLD", 2)
+        monkeypatch.setattr(ws_fallback, "AGENT_URL", "ws://agent.test/agent")
+        monkeypatch.setattr(ws_fallback, "_ping_probe", lambda *a, **kw: True)
+        def dead(url, t):
+            raise OSError("connection refused")
+        monkeypatch.setattr(ws_fallback, "_connect", dead)
+        with pytest.raises(ws_fallback.WsUnavailable):
+            ws_fallback.chat_stream({}, timeout=30)
+        assert not ws_fallback.breaker_open()
+        with pytest.raises(ws_fallback.WsUnavailable):
+            ws_fallback.chat_stream({}, timeout=30)
+        assert ws_fallback.breaker_open()
+        # breaker path short-circuits without touching _connect
+        monkeypatch.setattr(ws_fallback, "_connect",
+                            lambda url, t: (_ for _ in ()).throw(AssertionError("must not connect")))
+        with pytest.raises(ws_fallback.WsUnavailable):
+            ws_fallback.chat_stream({}, timeout=30)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 3 (Synergy #15) — dashboard routes + tiered egress chain
+# ═══════════════════════════════════════════════════════════════════
+
+class FakeDirectResp:
+    """requests.Response stand-in for the direct/thermoptic tiers."""
+    def __init__(self, status=200, body=SSE_BODY):
+        self.status_code = status
+        self._body = body
+        self.text = body.decode("utf-8", "replace")
+        self.headers = {}
+
+    def iter_lines(self):
+        for line in self._body.split(b"\n"):
+            if line.strip():
+                yield line.rstrip(b"\r")
+
+
+class TestDashboardRoutes:
+    def test_state_shape(self, client):
+        r = client.get("/api/dashboard/state")
+        assert r.status_code == 200
+        snap = r.get_json()
+        for key in ("totals", "status_codes", "via", "models", "blocks",
+                    "features", "latency", "clients", "request_log",
+                    "control", "health_mini"):
+            assert key in snap
+        assert snap["health_mini"]["backend_pref"] == "owl-first"
+
+    def test_control_sets_backend_pref(self, client):
+        r = client.post("/api/dashboard/control",
+                        json={"backend_pref": "thermoptic-first"})
+        assert r.status_code == 200 and r.get_json()["ok"] is True
+        assert metrics.backend_pref() == "thermoptic-first"
+
+    def test_control_rejects_invalid_pref(self, client):
+        r = client.post("/api/dashboard/control", json={"backend_pref": "yolo"})
+        assert r.status_code == 400
+        assert metrics.backend_pref() == "owl-first"
+
+    def test_control_clear_negative_cache(self, client, monkeypatch):
+        from cache import mark_permanent_failure, is_permanent_failure_cached
+        mark_permanent_failure("zai_glm-5-turbo", "quota_exhausted", "t@x")
+        assert is_permanent_failure_cached("zai_glm-5-turbo", "t@x")
+        r = client.post("/api/dashboard/control", json={"action": "clear_negative_cache"})
+        assert r.status_code == 200
+        assert not is_permanent_failure_cached("zai_glm-5-turbo", "t@x")
+
+    def test_control_reset_metrics(self, client):
+        metrics.record("/v1/x", 200)
+        r = client.post("/api/dashboard/control", json={"action": "reset_metrics"})
+        assert r.get_json()["ok"] is True
+        assert metrics.snapshot()["totals"]["requests"] == 0
+
+    def test_control_requires_api_key_when_configured(self, flask_env, monkeypatch):
+        monkeypatch.setattr(flask_env, "PROXY_API_KEY", "sekrit")
+        c = flask_env.app.test_client()
+        r = c.post("/api/dashboard/control", json={"action": "reset_metrics"})
+        assert r.status_code == 401
+        r = c.post("/api/dashboard/control", json={"action": "reset_metrics"},
+                   headers={"Authorization": "Bearer sekrit"})
+        assert r.status_code == 200
+
+    def test_dashboard_page_served(self, client):
+        r = client.get("/dashboard")
+        assert r.status_code == 200
+        assert b"<div id=\"root\">" in r.data
+
+
+class TestEgressChain:
+    """Tiered egress: owl → thermoptic → direct → ws-local-agent."""
+
+    def test_direct_path_records_metrics(self, client, proxy_mod, monkeypatch):
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        monkeypatch.setattr(proxy_mod.req_lib, "post",
+                            lambda *a, **kw: FakeDirectResp())
+        r = client.post("/v1/chat/completions",
+                        json={"model": "cheap", "stream": True,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 200
+        assert r.headers["X-Upstream-Via"] == "direct"
+        snap = metrics.snapshot()
+        assert snap["via"]["direct"] >= 1
+        assert snap["models"]["cheap"] >= 1
+
+    def test_thermoptic_tier_serves_when_healthy(self, client, monkeypatch):
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        monkeypatch.setattr(thermoptic_bridge, "ENV_ENABLED", True)
+        monkeypatch.setattr(thermoptic_bridge, "healthy", lambda: True)
+        monkeypatch.setattr(thermoptic_bridge, "http_request",
+                            lambda *a, **kw: FakeDirectResp())
+        r = client.post("/v1/chat/completions",
+                        json={"model": "cheap", "stream": True,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 200
+        assert r.headers["X-Upstream-Via"] == "thermoptic"
+        assert metrics.snapshot()["features"]["thermoptic"] == 1
+
+    def test_thermoptic_down_falls_to_direct(self, client, proxy_mod, monkeypatch):
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        monkeypatch.setattr(thermoptic_bridge, "ENV_ENABLED", True)
+        monkeypatch.setattr(thermoptic_bridge, "healthy", lambda: False)
+        posted = {"n": 0}
+        def fake_post(*a, **kw):
+            posted["n"] += 1
+            return FakeDirectResp()
+        monkeypatch.setattr(proxy_mod.req_lib, "post", fake_post)
+        r = client.post("/v1/chat/completions",
+                        json={"model": "cheap", "stream": True,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 200
+        assert r.headers["X-Upstream-Via"] == "direct"
+        assert posted["n"] == 1
+
+    def test_direct_only_pref_skips_owl_and_thermoptic(self, client, proxy_mod, monkeypatch):
+        metrics.set_backend_pref("direct-only")
+        def forbidden(*a, **kw):
+            raise AssertionError("owl tier must not be called in direct-only mode")
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: True)
+        monkeypatch.setattr(owl_bridge, "owl_stream_request", forbidden)
+        monkeypatch.setattr(thermoptic_bridge, "ENV_ENABLED", True)
+        monkeypatch.setattr(thermoptic_bridge, "healthy", lambda: True)
+        monkeypatch.setattr(thermoptic_bridge, "http_request", forbidden)
+        monkeypatch.setattr(proxy_mod.req_lib, "post",
+                            lambda *a, **kw: FakeDirectResp())
+        r = client.post("/v1/chat/completions",
+                        json={"model": "cheap", "stream": True,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 200
+        assert r.headers["X-Upstream-Via"] == "direct"
+
+    def test_ws_fallback_engages_on_network_fault(self, client, proxy_mod, monkeypatch):
+        import requests as req_lib
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        def net_fail(*a, **kw):
+            raise req_lib.exceptions.ConnectionError("upstream unreachable")
+        monkeypatch.setattr(proxy_mod.req_lib, "post", net_fail)
+        monkeypatch.setattr(ws_fallback, "ENV_ENABLED", True)
+        monkeypatch.setattr(ws_fallback, "chat_stream",
+                            lambda body, timeout=None: OwlStreamResponse(
+                                200, {"content-type": "text/event-stream"},
+                                byte_iter=iter([SSE_BODY])))
+        r = client.post("/v1/chat/completions",
+                        json={"model": "cheap", "stream": True,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 200
+        assert r.headers["X-Upstream-Via"] == "ws-local-agent"
+        assert b'"content": "Hello"' in r.data
+        assert metrics.snapshot()["features"]["ws_fallback"] == 1
+
+    def test_ws_fallback_does_not_engage_on_http_error(self, client, proxy_mod, monkeypatch):
+        """HTTP error statuses are upstream decisions — never a WS trigger."""
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        class ErrResp:
+            status_code = 401
+            text = '{"error": "nope"}'
+            headers = {}
+            def iter_lines(self):
+                return iter(())
+        monkeypatch.setattr(proxy_mod.req_lib, "post", lambda *a, **kw: ErrResp())
+        monkeypatch.setattr(ws_fallback, "ENV_ENABLED", True)
+        monkeypatch.setattr(ws_fallback, "chat_stream",
+                            lambda *a, **kw: (_ for _ in ()).throw(
+                                AssertionError("WS must not fire on HTTP errors")))
+        r = client.post("/v1/chat/completions",
+                        json={"model": "cheap", "stream": False,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 401
+        assert r.headers["X-Upstream-Via"] == "direct"
+
+    def test_all_tiers_down_returns_502(self, client, proxy_mod, monkeypatch):
+        import requests as req_lib
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        monkeypatch.setattr(ws_fallback, "ENV_ENABLED", False)
+        def net_fail(*a, **kw):
+            raise req_lib.exceptions.ConnectionError("refused")
+        monkeypatch.setattr(proxy_mod.req_lib, "post", net_fail)
+        r = client.post("/v1/chat/completions",
+                        json={"model": "cheap", "stream": True,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 502
+        assert r.get_json()["error"]["type"] == "network_error"

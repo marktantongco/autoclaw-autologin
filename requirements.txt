@@ -7,3 +7,7 @@ httpx[http2]>=0.27
 aiohttp-socks>=0.9        # optional but recommended: SOCKS4/5 proxy support
 # curl_cffi>=0.7           # optional: TLS impersonation (set OWL_TLS_IMPERSONATE=chrome110)
 # pytest>=8.0              # optional: run the test suite (test_owl_integration.py)
+# ── Phase 3 (v2.3.0): WS fallback + React dashboard metrics stream ──
+websocket-client>=1.6    # cloud-to-local WS fallback (Synergy 13)
+flask-sock>=0.7          # /api/dashboard/stream WebSocket endpoint
+simple-websocket>=1.0    # flask-sock transport

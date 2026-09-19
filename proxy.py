@@ -59,12 +59,38 @@ import loop_breaker
 # function-calling (buffered + streaming) for tools-less upstreams.
 import dsml_shim
 
+# Phase 3 (Synergies 13/14/15): cloud-to-local WebSocket fallback
+# (eequaled/GLM_proxy), thermoptic real-browser camouflage egress
+# (mandatoryprogrammer/thermoptic — supersedes the uTLS ClientHello item),
+# and the runtime metrics registry powering the React dashboard
+# (guell11/OmniClaw-GLM-Proxy).
+import metrics
+import ws_fallback
+import thermoptic_bridge
+
 # ─── Structured Logging ──────────────────────────────────────────────
 logger = logging.getLogger("autoclaw.proxy")
 
 TOKENS_FILE_FULL = TOKENS_FILE  # full path for backup operations
 
 app = Flask(__name__)
+
+@app.before_request
+def _metrics_before():
+    """Phase 3: request timing + client capture for the metrics registry."""
+    g._request_start = time.time()
+    xff = request.headers.get("X-Forwarded-For", "")
+    g._client_ip = (xff.split(",")[0].strip() if xff else (request.remote_addr or ""))
+    g._metrics_block = None
+    g._metrics_feature = None
+    g._wants_stream = None
+    g._model = None
+
+
+# Routes excluded from metrics (static assets / dashboard self-polling —
+# recording them would just add noise to the operator's own dashboard).
+_METRICS_SKIP_PREFIXES = ("/ui", "/dashboard", "/api/dashboard", "/static", "/favicon")
+
 
 @app.after_request
 def _owl_via_header(resp):
@@ -73,6 +99,24 @@ def _owl_via_header(resp):
         via = g.get("_upstream_via")
         if via:
             resp.headers["X-Upstream-Via"] = via
+    except Exception:
+        pass
+    # Phase 3 (Synergy #15): feed the dashboard metrics registry.
+    try:
+        path = request.path
+        if not path.startswith(_METRICS_SKIP_PREFIXES):
+            via = g.get("_upstream_via") or ("local" if not path.startswith("/v1/") else "direct")
+            metrics.record(
+                route=path,
+                status=resp.status_code,
+                via=via,
+                latency_ms=(time.time() - g.get("_request_start", time.time())) * 1000.0,
+                client_ip=g.get("_client_ip"),
+                model=g.get("_model"),
+                stream=bool(g.get("_wants_stream")),
+                block=g.get("_metrics_block"),
+                feature=g.get("_metrics_feature"),
+            )
     except Exception:
         pass
     return resp
@@ -370,6 +414,7 @@ def chat_completions():
         logger.info("!router command intercepted (not forwarded upstream)")
         return jsonify(router_resp)
 
+    g._model = body.get("model", DEFAULT_MODEL)  # Phase 3: metrics tag
     # Model mapping with strict validation (Audit Fix: silent fallback to expensive model)
     client_model = body.get("model", DEFAULT_MODEL)
     upstream_model = MODEL_MAP.get(client_model)
@@ -407,6 +452,7 @@ def chat_completions():
     if fp:
         verdict = loop_breaker.check(fp, body.get("messages"), client_model)
         if verdict:
+            g._metrics_block = "loop_breaker"
             logger.warning(
                 f"loop_breaker trip: fp={fp[:12]}... reemits={verdict['reemits']} "
                 f"fill={verdict['ratio']:.0%} est={verdict['estimated_tokens']}"
@@ -463,6 +509,7 @@ def chat_completions():
     else:
         access_token, acc = get_next_token()
     if not access_token:
+        g._metrics_block = "auth_failed"
         return jsonify({
             "error": {
                 "message": "No valid tokens. Add accounts first via /login or manually edit tokens.json",
@@ -485,6 +532,7 @@ def chat_completions():
     # known to be permanently failed (quota exhausted, banned, etc.).
     used_email = acc.get("email", "unknown")
     if is_permanent_failure_cached(upstream_model, used_email):
+        g._metrics_block = "negative_cache"
         logger.warning(
             f"Permanent-failure cache hit: model={upstream_model} "
             f"account={used_email} — returning 429 without forwarding upstream"
@@ -509,39 +557,110 @@ def chat_completions():
     headers["X-Request-Model"] = upstream_model
 
     client_wants_stream = body.get("stream", False)
+    g._wants_stream = client_wants_stream
 
     try:
-        # ── Synergy 6: OWL proxy-first streaming (owl-agent v5.3) ──
-        # Race HEDGE_FANOUT free proxies for connection establishment;
-        # first to deliver headers carries the SSE stream. Direct fallback
-        # fires when OWL is disabled, unavailable, or the race is lost.
+        # ── Phase 3: tiered egress chain (Synergies 6 × 13 × 14) ──
+        # Tier order comes from the dashboard control surface:
+        #   owl-first (default)  owl → thermoptic → direct
+        #   thermoptic-first     thermoptic → owl → direct
+        #   direct-only          direct
+        # Every tier failure falls to the next; WS local-agent fallback
+        # (#13) engages ONLY after a NETWORK-level fault (connection
+        # refused / DNS / connect timeout). HTTP error statuses are
+        # upstream decisions and return to the client verbatim.
+        pref = metrics.backend_pref()
+        tiers = []
+        if pref == "direct-only":
+            tiers.append("direct")
+        elif pref == "thermoptic-first":
+            if thermoptic_bridge.healthy():
+                tiers.append("thermoptic")
+            if owl_bridge.owl_enabled():
+                tiers.append("owl")
+            tiers.append("direct")
+        else:  # owl-first (default)
+            if owl_bridge.owl_enabled():
+                tiers.append("owl")
+            if thermoptic_bridge.healthy():
+                tiers.append("thermoptic")
+            tiers.append("direct")
+
         upstream_resp = None
-        via = "direct"
-        if owl_bridge.owl_enabled():
+        via = None
+        last_net_exc = None
+        for tier in tiers:
             try:
-                upstream_resp = owl_bridge.owl_stream_request(
-                    "POST", CHAT_COMPLETIONS,
-                    headers=headers, json_body=upstream_body, timeout=600,
-                )
-                via = f"owl-proxy/{owl_bridge.owl_backend()}"
-                logger.info(f"Chat upstream via {via}")
+                if tier == "owl":
+                    upstream_resp = owl_bridge.owl_stream_request(
+                        "POST", CHAT_COMPLETIONS,
+                        headers=headers, json_body=upstream_body, timeout=600,
+                    )
+                    via = f"owl-proxy/{owl_bridge.owl_backend()}"
+                elif tier == "thermoptic":
+                    upstream_resp = thermoptic_bridge.http_request(
+                        "POST", CHAT_COMPLETIONS,
+                        headers=headers, json_body=upstream_body,
+                        stream=True, timeout=600,
+                    )
+                    via = "thermoptic"
+                    g._metrics_feature = "thermoptic"
+                else:
+                    # Always request stream from upstream (direct path)
+                    upstream_resp = req_lib.post(
+                        CHAT_COMPLETIONS,
+                        json=upstream_body,
+                        headers=headers,
+                        stream=True,
+                        timeout=600,
+                        verify=False,
+                    )
+                    via = "direct"
+                break
             except owl_bridge.OwlUnavailable as e:
-                logger.warning(f"OWL unavailable → direct fallback: {e}")
-                upstream_resp = None
-        g._upstream_via = via
+                logger.warning(f"[{tier}] unavailable → next tier: {e}")
+            except thermoptic_bridge.ThermopticUnavailable as e:
+                logger.warning(f"[{tier}] unavailable → next tier: {e}")
+            except (req_lib.exceptions.ConnectionError,
+                    req_lib.exceptions.Timeout) as e:
+                last_net_exc = e
+                logger.warning(
+                    f"[{tier}] network fault → next tier: "
+                    f"{type(e).__name__}: {e}")
+
+        # ── Synergy 13: cloud-to-local WS fallback (last resort) ──
+        if (upstream_resp is None and ws_fallback.enabled()
+                and last_net_exc is not None):
+            try:
+                upstream_resp = ws_fallback.chat_stream(
+                    upstream_body, timeout=600)
+                via = "ws-local-agent"
+                g._metrics_feature = "ws_fallback"
+                logger.info("Chat upstream via ws-local-agent "
+                            "(cloud unreachable)")
+            except ws_fallback.WsUnavailable as e:
+                logger.warning(f"ws-local-agent unavailable: {e}")
+
         if upstream_resp is None:
-            # Always request stream from upstream (direct path)
-            upstream_resp = req_lib.post(
-                CHAT_COMPLETIONS,
-                json=upstream_body,
-                headers=headers,
-                stream=True,
-                timeout=600,
-                verify=False,
-            )
+            g._upstream_via = "none"
+            if last_net_exc is not None:
+                return jsonify({"error": {
+                    "message": (f"Upstream unreachable "
+                                f"({type(last_net_exc).__name__}: "
+                                f"{last_net_exc})"),
+                    "type": "network_error",
+                }}), 502
+            return jsonify({"error": {
+                "message": "No upstream transport available",
+                "type": "network_error",
+            }}), 502
+
+        g._upstream_via = via
+        logger.info(f"Chat upstream via {via}")
 
         if upstream_resp.status_code != 200:
-            if isinstance(upstream_resp, owl_bridge.OwlStreamResponse):
+            if isinstance(upstream_resp, (owl_bridge.OwlStreamResponse,
+                                          ws_fallback.WsStreamResponse)):
                 raw_error = upstream_resp.read_error(1000)
             else:
                 raw_error = upstream_resp.text[:1000]
@@ -787,6 +906,11 @@ def health():
         "loop_breaker": loop_breaker.stats(),
         # Synergy 8 (Phase 2): DSML tool-calling shim (chat-z-ai-proxy)
         "dsml": dsml_shim.stats(),
+        # Phase 3: WS local-agent fallback (#13), thermoptic egress (#14),
+        # dashboard metrics (#15)
+        "ws_fallback": ws_fallback.stats(),
+        "thermoptic": thermoptic_bridge.stats(),
+        "metrics": metrics.stats(),
     })
 
 
@@ -1222,9 +1346,115 @@ def api_wallet_email(email=None):
     return jsonify(result)
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Phase 3 (Synergy #15): React dashboard — REST snapshot, control surface,
+# long-running WebSocket metrics push.
+# Source: guell11/OmniClaw-GLM-Proxy "Local React Dashboard"
+# ──────────────────────────────────────────────────────────────────────────
+
+DASHBOARD_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "ui", "dashboard")
+
+
+@app.route("/dashboard")
+@app.route("/dashboard/")
+def dashboard_index():
+    return send_from_directory(DASHBOARD_DIR, "index.html")
+
+
+@app.route("/dashboard/<path:path>")
+def dashboard_static(path):
+    return send_from_directory(DASHBOARD_DIR, path)
+
+
+def _dashboard_health_mini():
+    """Compact health digest embedded in every dashboard payload."""
+    try:
+        return {
+            "version": VERSION,
+            "accounts": len(load_tokens()["accounts"]),
+            "owl_enabled": owl_bridge.owl_enabled(),
+            "thermoptic_healthy": thermoptic_bridge.healthy(),
+            "ws_fallback_ready": ws_fallback.available(),
+            "backend_pref": metrics.backend_pref(),
+        }
+    except Exception:
+        return {}
+
+
+@app.route("/api/dashboard/state", methods=["GET"])
+def dashboard_state():
+    """Full metrics snapshot (REST fallback for the WebSocket stream)."""
+    snap = metrics.snapshot()
+    snap["health_mini"] = _dashboard_health_mini()
+    return jsonify(snap)
+
+
+@app.route("/api/dashboard/control", methods=["POST"])
+def dashboard_control():
+    """Backend-switch control surface (OmniClaw dashboard contract).
+
+    Actions:
+      {"backend_pref": "owl-first"|"thermoptic-first"|"direct-only"}
+      {"action": "clear_negative_cache"}   — wipe permanent-failure cache
+      {"action": "reset_metrics"}          — zero the dashboard counters
+    Protected by PROXY_API_KEY when one is configured (routing control is
+    privileged, unlike read-only state).
+    """
+    if PROXY_API_KEY:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {PROXY_API_KEY}":
+            return jsonify({"error": {"message": "Invalid API key",
+                                      "type": "auth_error"}}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    if "backend_pref" in body:
+        ok, msg = metrics.set_backend_pref(body.get("backend_pref"))
+        return jsonify({"ok": ok, "message": msg}), (200 if ok else 400)
+    action = body.get("action")
+    if action == "clear_negative_cache":
+        clear_permanent_failures()
+        return jsonify({"ok": True, "message": "negative cache cleared"})
+    if action == "reset_metrics":
+        metrics.reset()
+        return jsonify({"ok": True, "message": "metrics reset"})
+    return jsonify({"ok": False,
+                    "message": "unknown control action"}), 400
+
+
+# Long-running WebSocket metrics endpoint (flask-sock is an optional dep —
+# when absent the dashboard transparently falls back to REST polling).
+try:
+    from flask_sock import Sock
+    _sock = Sock(app)
+except Exception as _e:  # pragma: no cover — exercised only without the dep
+    logger.info(f"flask-sock unavailable ({_e}) — dashboard falls back "
+                f"to REST polling")
+    _sock = None
+
+if _sock is not None:
+    @_sock.route("/api/dashboard/stream")
+    def dashboard_stream(ws):
+        """Push a metrics snapshot every second; sender-closed detection
+        relies on send() raising when the peer disconnects."""
+        import simple_websocket
+        try:
+            ws.send(json.dumps({"hello": True,
+                                "version": VERSION}))
+            while True:
+                snap = metrics.snapshot()
+                snap["health_mini"] = _dashboard_health_mini()
+                ws.send(json.dumps(snap))
+                time.sleep(1.0)
+        except simple_websocket.ConnectionClosed:
+            pass
+        except Exception as e:
+            logger.debug(f"dashboard stream closed: {e}")
+
+
 if __name__ == "__main__":
     logger.info(f"AutoClaw Proxy starting on {PROXY_HOST}:{PROXY_PORT}")
-    logger.info(f"Dashboard: http://localhost:{PROXY_PORT}")
+    logger.info(f"Dashboard (React): http://localhost:{PROXY_PORT}/dashboard")
+    logger.info(f"Dashboard (classic): http://localhost:{PROXY_PORT}")
     logger.info(f"API: http://localhost:{PROXY_PORT}/v1/chat/completions")
     logger.info(f"Models: {', '.join(MODEL_MAP.keys())}")
     list_accounts()

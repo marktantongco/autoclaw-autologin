@@ -289,6 +289,77 @@ turn resets the streak — legitimate long conversations are never killed.
 | `AUTOCLAW_LOOP_TTL` | `3600` | Streak memory (s) |
 | `AUTOCLAW_CONTEXT_WINDOW` | *(per-model)* | Global context-window override |
 
+## 🧩 Phase 3 — WS Fallback, thermoptic Egress, React Dashboard (v2.3.0)
+
+Completes the Priority-3 tier of the AutoClaw Ecosystem Synergy Research
+Deep-Dive: #13 cloud-to-local WebSocket fallback (eequaled/GLM_proxy),
+#14 browser-grade traffic camouflaging via
+[mandatoryprogrammer/thermoptic](https://github.com/mandatoryprogrammer/thermoptic)
+(ISC) — a strictly stronger superset of the uTLS Chrome-120 ClientHello
+item — and #15 the local React dashboard (guell11/OmniClaw-GLM-Proxy).
+
+### Tiered egress chain
+
+The chat route now walks transport tiers, order controlled at runtime from
+the dashboard (no restart):
+
+    owl-first (default)    owl free-pool racing → thermoptic → direct
+    thermoptic-first       thermoptic → owl → direct
+    direct-only            direct
+
+After every tier hits a *network-level* fault (connection refused / DNS /
+connect timeout — never HTTP 4xx/5xx), the cloud-to-local **WebSocket
+fallback** transparently re-routes the request through a locally running
+AutoClaw desktop agent (wire contract `autoclaw-ws-agent-v1`, see
+`ws_fallback.py`), streaming SSE frames back through the same DSML sieve
+path. A network-only breaker (3 strikes → 60 s cooldown) keeps a dead
+agent from adding latency.
+
+### thermoptic egress (browser camouflage)
+
+[thermoptic](https://github.com/mandatoryprogrammer/thermoptic) is a local
+HTTP proxy that replays requests through a real Chrome instance, making
+JA3/JA4/JA4H fingerprints indistinguishable from a genuine browser. Run it
+with `scripts/thermoptic-up.sh` (Docker), set `OWL_THERMOPTIC_ENABLED=1`,
+and the proxy probes it, routes through it, and degrades gracefully when
+it is down. See `deploy/thermoptic-README.md`.
+
+### React dashboard (`/dashboard`)
+
+A built React (Vite) bundle served from `ui/dashboard/` — live request
+counters, latency sparkline, per-transport egress distribution, status
+codes, block + feature counters, masked-IP client list, a capped request
+log, and the backend-switch control surface. Data flows over a
+long-running WebSocket (`/api/dashboard/stream`, flask-sock) with
+automatic REST polling fallback (`/api/dashboard/state`). The classic UI
+remains at `/`.
+
+### Live smoke test
+
+`scripts/smoke_test_dsml_live.py` boots the real proxy and drives the DSML
+tool-calling shim against the real upstream edge (banner + DSML injection
+over the live wire, OWL-raced attempt, i18n-translated upstream decision).
+With `tokens.json` present it additionally runs full buffered + streaming
+tool-call round-trips and asserts no DSML markup leakage.
+
+### Phase-3 environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ACLAW_WS_FALLBACK` | `0` | WS local-agent fallback master switch |
+| `ACLAW_WS_AGENT_URL` | *(discovery)* | Exact agent ws:// URL (skips port scan) |
+| `ACLAW_WS_DISCOVERY_PORTS` | `18789,18790,18791` | Local discovery ports |
+| `ACLAW_WS_TIMEOUT` | `600` | WS stream cap (s) |
+| `ACLAW_WS_BREAKER_THRESHOLD` | `3` | Network failures before breaker opens |
+| `ACLAW_WS_BREAKER_COOLDOWN` | `60` | Breaker cooldown (s) |
+| `OWL_THERMOPTIC_ENABLED` | `0` | thermoptic egress tier switch |
+| `OWL_THERMOPTIC_URL` | `http://127.0.0.1:1234` | thermoptic proxy URL |
+| `OWL_THERMOPTIC_CA` | *(verify off)* | thermoptic rootCA.crt (recommended) |
+| `OWL_THERMOPTIC_USERNAME/PASSWORD` | *(none)* | thermoptic proxy auth |
+| `OWL_THERMOPTIC_TIMEOUT` | `6` | Probe/connect cap (s) |
+| `OWL_THERMOPTIC_PROBE_TTL` | `30` | Positive probe cache (s) |
+| `ACLAW_METRICS_LOG_CAP` | `250` | Dashboard request-log size |
+
 ## License
 
 

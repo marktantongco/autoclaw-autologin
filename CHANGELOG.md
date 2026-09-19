@@ -1,5 +1,75 @@
 # Changelog
 
+## v2.3.0 — Phase 3: WS Fallback + thermoptic Egress + React Dashboard (2026-09-20)
+
+**Synergies implemented:** #13 cloud-to-local WebSocket fallback
+(eequaled/GLM_proxy), #14 real-browser traffic camouflaging via
+mandatoryprogrammer/thermoptic (supersedes the uTLS Chrome-120 ClientHello
+item with a strictly stronger mechanism), #15 local React dashboard
+(guell11/OmniClaw-GLM-Proxy) — the Priority-3 tier of the AutoClaw
+Ecosystem Synergy Research Deep-Dive, per the Phase-3 roadmap.
+
+### Added
+
+- **`ws_fallback.py` (Synergy 13)** — cloud-to-local WebSocket transport:
+  - Engages ONLY after every HTTP tier hits a network-level fault
+    (connection refused / DNS / connect timeout); HTTP 4xx/5xx are
+    upstream decisions and pass through verbatim
+  - Wire contract `autoclaw-ws-agent-v1`: chat.request / chat.headers /
+    chat.delta (raw SSE in `sse`) / chat.end / chat.error; SSE frames
+    reassemble into a requests-compatible `iter_lines()` shim so the DSML
+    sieve and streaming path work unchanged over WebSocket
+  - Local-agent discovery: exact `ACLAW_WS_AGENT_URL` or 127.0.0.1 port
+    scan (60 s positive / 10 s negative cache); network-only breaker
+    (3 strikes → 60 s open); chat.error envelopes never trip the breaker
+- **`thermoptic_bridge.py` (Synergy 14)** — real-browser JA4+ camouflage
+  egress tier via mandatoryprogrammer/thermoptic (Docker/CDP out-of-process):
+  - Health probe (gstatic 204 through the tunnel, 30 s positive cache),
+    transport-only breaker, optional proxy auth + rootCA trust
+  - Slots into the egress chain (owl → thermoptic → direct; order
+    runtime-switchable); `X-Upstream-Via: thermoptic` observability
+  - Launcher `scripts/thermoptic-up.sh` + `deploy/thermoptic-README.md`
+- **`metrics.py` + React dashboard (Synergy 15)** — the OmniClaw operator
+  surface, rebuilt as a Vite/React bundle served at `/dashboard`:
+  - Thread-safe in-process registry: totals, per-status/per-transport/
+    per-model counters, block counters (loop_breaker, negative_cache,
+    auth_failed), feature activations (dsml_shim, ws_fallback,
+    thermoptic), latency EMA + p95 + sparkline window, capped request
+    log, SHA-256 masked-IP client list (raw IPs never stored)
+  - `GET /api/dashboard/state` snapshot; long-running WebSocket push
+    `/api/dashboard/stream` (flask-sock, 1 Hz) with REST fallback
+  - `POST /api/dashboard/control` backend-switch control surface
+    (owl-first | thermoptic-first | direct-only) + clear-negative-cache +
+    reset-metrics; protected by `AUTOCLAW_PROXY_API_KEY` when set
+- **Tiered egress chain in `proxy.py`** — owl → thermoptic → direct (or
+  thermoptic-first), each tier falling to the next on failure, then the
+  WS local-agent as last resort on network faults; metrics + masked
+  client tagging via before/after-request hooks; `/health` gains
+  `ws_fallback`, `thermoptic`, `metrics` blocks
+- **`scripts/smoke_test_dsml_live.py`** — live smoke: boots the real
+  proxy, probes real upstream egress (direct + OWL-raced), sends the
+  banner+DSML envelope over the live wire, and (with tokens.json) runs
+  full buffered + streaming tool-call round-trips checking
+  `X-DSML-Shim: 1` and zero markup leakage
+
+### Fixed
+
+- Latent deadlock: `metrics.snapshot()` re-entered the non-reentrant
+  registry lock via `backend_pref_info()` → `/health` hung forever
+  (caught by the route test suite timeout)
+- `WsStreamResponse.read_error()` now drains pending agent frames so
+  late `chat.error` envelopes (arriving after `chat.headers`) surface in
+  the proxy's error path instead of returning an empty body
+
+### Tests
+
+- 112 → **148 offline tests** (+36): metrics registry, backend-pref
+  control, thermoptic probe/breaker/auth/verify, WS protocol shim +
+  scripted local-agent (discovery, breaker, error envelopes), dashboard
+  routes, and full egress-chain integration (tier ordering, WS-on-
+  network-fault-only rule, direct-only escape hatch)
+- Live smoke 12/12 stages (see `scripts/smoke_test_dsml_live.py`)
+
 ## v2.2.0 — Phase 2: DSML Tool-Calling Shim + Per-Chat Fingerprint + loop_breaker (2026-09-20)
 
 **Synergies implemented:** #8 DSML tool-calling shim
