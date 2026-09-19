@@ -89,3 +89,70 @@ if _os.path.exists(_PROXY_FILE):
 # ── Billing Header Quirks ──
 # LLM proxy: X-Authorization (capital X)
 # Assetmgr: authorization (lowercase)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Synergy 1: Output-Cap Clamping
+# Source: eequaled/GLM_proxy lib/core.js (OUTPUT_CAPS, clampMaxOutput)
+# ──────────────────────────────────────────────────────────────────────────
+# Probe-verified: requesting >131072 output tokens triggers silent DeepSeek
+# substitution in AutoClaw cloud — the response is delivered but billed as
+# DeepSeek-V4-Pro credits (~7x more expensive than GLM-5.2). The client
+# never sees a warning, only the operator gets the bill at month's end.
+# These caps prevent that by clamping max_tokens per-model before the
+# request is forwarded upstream.
+OUTPUT_CAPS = {
+    "openrouter_glm-5.2": 131072,   # GLM-5.2 — exact probe-verified threshold
+    "zai_glm-5-turbo": 65536,        # GLM-5-Turbo — conservative (always available)
+    "zai_auto": 32768,               # DeepSeek-V4-Pro — cap aggressively to
+                                      # prevent billing surprise when "auto" alias
+                                      # is used (it always routes to DeepSeek)
+    "zai_glm-5": 131072,             # GLM-5 — same family as 5.2
+    "default": 65536,                 # Unknown model — be safe
+}
+
+
+def clamp_max_output(model_alias: str, requested: int = None) -> int:
+    """Clamp max_tokens to safe model-specific limit.
+
+    Prevents silent DeepSeek substitution when requesting >131072 output
+    tokens — AutoClaw cloud silently switches to DeepSeek-V4-Pro (7x cost)
+    when the requested output exceeds the GLM cap, and the operator only
+    finds out at month-end billing.
+
+    Synergy: eequaled/GLM_proxy lib/core.js (clampMaxOutput)
+
+    Args:
+        model_alias: client-facing model alias (e.g. "glm-5.2", "cheap",
+            "auto"). Will be looked up via MODEL_MAP to find the upstream
+            model name. Falls back to DEFAULT_MODEL if not in MODEL_MAP.
+        requested: client-requested max_tokens value. If None or larger
+            than the model's cap, the cap is returned instead.
+
+    Returns:
+        int: safe max_tokens value, never exceeding the model's cap. If
+        `requested` is smaller than the cap, `requested` is returned
+        unchanged (clamp, never inflate).
+    """
+    upstream = MODEL_MAP.get(model_alias, DEFAULT_MODEL) if isinstance(model_alias, str) else None
+    cap = OUTPUT_CAPS.get(upstream, OUTPUT_CAPS["default"]) if upstream else OUTPUT_CAPS["default"]
+    if requested is None or requested > cap:
+        return cap
+    return requested
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Synergy 2: System-Banner Injection
+# Source: eequaled/GLM_proxy lib/core.js (injectSystemBanner,
+#         AUTOCLAW_SYSTEM_BANNER)
+# ──────────────────────────────────────────────────────────────────────────
+# Probe-verified: AutoClaw upstream requires a specific system banner as
+# the first system message in the chat. Without it, the upstream returns
+# HTTP 400 and traffic silently falls into the unmetered WS agent path
+# (which is unreliable and bypasses billing telemetry). This banner is
+# prepended to the user's existing system message, or inserted as a new
+# system message at index 0 if the request has no system message.
+AUTOCLAW_SYSTEM_BANNER = os.environ.get(
+    "AUTOCLAW_SYSTEM_BANNER",
+    "You are a personal assistant running inside OpenClaw.\n## Tooling"
+)

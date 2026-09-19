@@ -11,6 +11,7 @@ Endpoints:
   GET  /auth/callback-google  — OAuth callback handler (auto-captures code)
 """
 
+import os
 import json
 import time
 import uuid
@@ -25,11 +26,24 @@ from config import (
     CHAT_COMPLETIONS, MODEL_MAP, DEFAULT_MODEL,
     PROXY_HOST, PROXY_PORT, TOKENS_FILE,
     STRICT_MODEL_VALIDATION, PROXY_API_KEY, TLS_VERIFY,
+    # Synergy 1: Output-cap clamping (clampMaxOutput / OUTPUT_CAPS)
+    # Synergy 2: System-banner injection (AUTOCLAW_SYSTEM_BANNER)
+    # Source: eequaled/GLM_proxy lib/core.js
+    OUTPUT_CAPS, clamp_max_output, AUTOCLAW_SYSTEM_BANNER,
 )
 from auth import (
     get_valid_token, refresh_all, list_accounts,
     check_wallet, check_ledger, load_tokens, save_tokens,
 )
+# Synergy 3: Permanent-failure negative cache (createPermanentFailureCache)
+# Source: eequaled/GLM_proxy lib/core.js
+from cache import (
+    is_permanent_failure_cached, mark_permanent_failure,
+    clear_permanent_failures,
+)
+# Synergy 4: Chinese → English error translation (ZH_ERROR_MAP)
+# Source: eequaled/GLM_proxy lib/core.js
+from i18n_errors import translate_error
 
 # ─── Structured Logging ──────────────────────────────────────────────
 logger = logging.getLogger("autoclaw.proxy")
@@ -151,6 +165,141 @@ def _sign_headers():
     }
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Synergy 2: System-Banner Injection (helper)
+# Source: eequaled/GLM_proxy lib/core.js (injectSystemBanner)
+# ──────────────────────────────────────────────────────────────────────────
+# AutoClaw upstream requires a specific system banner as the first system
+# message — without it, upstream returns HTTP 400 and traffic falls into
+# the unmetered WS agent path. We prepend to an existing system message,
+# or insert a new system message at index 0 if none exists. The helper is
+# a pure function on a messages list (caller must hand us a copy if it
+# wants the original preserved).
+def _inject_system_banner(messages):
+    """Inject required AutoClaw system banner before the user's first message.
+
+    Synergy: eequaled/GLM_proxy lib/core.js (injectSystemBanner)
+
+    Mutates `messages` in-place. If messages[0] is already a system
+    message, the banner is prepended to its content (with a blank-line
+    separator). Otherwise a new system message is inserted at index 0.
+    Re-injection is idempotent — if the banner is already present in
+    messages[0]['content'], no change is made.
+
+    Args:
+        messages: list of OpenAI message dicts. Caller should pass a
+            shallow-copied list (e.g. list(original)) to avoid mutating
+            the caller's request body. Message dicts that are system
+            messages are replaced with new dict instances so we don't
+            mutate shared references.
+
+    Returns:
+        The same `messages` list (mutated in-place) for chaining.
+    """
+    if not messages:
+        return messages
+    if messages[0].get("role") == "system":
+        existing = messages[0].get("content", "")
+        if isinstance(existing, str) and AUTOCLAW_SYSTEM_BANNER not in existing:
+            # Replace dict (not mutate) so we don't break shared refs
+            new_sys = dict(messages[0])
+            new_sys["content"] = AUTOCLAW_SYSTEM_BANNER + "\n\n" + existing
+            messages[0] = new_sys
+        return messages
+    # No system message at index 0 — insert one
+    messages.insert(0, {"role": "system", "content": AUTOCLAW_SYSTEM_BANNER})
+    return messages
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Synergy 5: In-chat !router Command (helper)
+# Source: eroslifestyle/ai-router-switch src/router_commands.py
+# ──────────────────────────────────────────────────────────────────────────
+# Switching backends normally requires changing env vars and restarting
+# the proxy. The !router command lets the operator do common operations
+# (status, reset, refresh-all, help) in-band via the chat-completions
+# endpoint — the proxy intercepts the command and returns a synthetic
+# OpenAI-shaped response without ever forwarding upstream.
+def _check_router_command(messages):
+    """Check if the last user message is a !router command.
+
+    Synergy: eroslifestyle/ai-router-switch src/router_commands.py
+
+    Returns a synthetic OpenAI-shaped response and never forwards
+    upstream. Supported sub-commands:
+      !router status       — show current model + account count
+      !router reset        — reset token rotation index to 0
+      !router refresh-all  — trigger async token refresh
+      !router help         — show this help text
+
+    Args:
+        messages: list of OpenAI message dicts from the request body.
+
+    Returns:
+        Tuple (synthetic_response_dict_or_None, is_command_bool). When
+        is_command is True, synthetic_response_dict is an OpenAI-shaped
+        dict ready to be returned by jsonify(). When False, the proxy
+        should proceed with normal chat completion handling.
+    """
+    if not messages:
+        return None, False
+    last_msg = messages[-1]
+    if last_msg.get("role") != "user":
+        return None, False
+    content = last_msg.get("content", "")
+    if isinstance(content, list):
+        # Multimodal content (vision requests) — concat text parts
+        content = " ".join(p.get("text", "") for p in content if isinstance(p, dict))
+    if not content.startswith("!router"):
+        return None, False
+
+    parts = content.split()
+    if len(parts) < 2:
+        return {"choices": [{"message": {"role": "assistant", "content":
+            "!router commands:\n"
+            "  !router status - Show current model + account\n"
+            "  !router reset - Reset token rotation index\n"
+            "  !router refresh-all - Force refresh all tokens\n"
+            "  !router help - Show this help"}}], "usage": {}}, True
+
+    cmd = parts[1].lower()
+    if cmd == "status":
+        data = load_tokens()
+        n_accounts = len(data.get("accounts", []))
+        return {"choices": [{"message": {"role": "assistant", "content":
+            f"Router Status:\n"
+            f"  Active accounts: {n_accounts}\n"
+            f"  Default model: {DEFAULT_MODEL}\n"
+            f"  Token cache TTL: 5s\n"
+            f"  Encryption: {'enabled' if os.environ.get('AUTOCLAW_TOKEN_KEY') else 'disabled'}"}}],
+            "usage": {}}, True
+    elif cmd == "reset":
+        global _token_idx
+        _token_idx = 0
+        return {"choices": [{"message": {"role": "assistant",
+            "content": "Token rotation index reset to 0."}}], "usage": {}}, True
+    elif cmd == "refresh-all":
+        # Trigger async refresh (non-blocking) so the chat client gets an
+        # immediate response — operator can poll /api/refresh-progress.
+        threading.Thread(target=refresh_all, daemon=True).start()
+        # Synergy 3: clear the permanent-failure cache so the proxy
+        # immediately re-attempts the upstream after refresh completes,
+        # rather than waiting 60s for TTL.
+        clear_permanent_failures()
+        return {"choices": [{"message": {"role": "assistant",
+            "content": "Token refresh triggered. "
+                       "Check /api/refresh-progress for status."}}],
+            "usage": {}}, True
+    elif cmd == "help":
+        return {"choices": [{"message": {"role": "assistant", "content":
+            "!router commands:\n"
+            "  !router status\n"
+            "  !router reset\n"
+            "  !router refresh-all\n"
+            "  !router help"}}], "usage": {}}, True
+    return None, False
+
+
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     """OpenAI-compatible chat completions proxy."""
@@ -164,6 +313,15 @@ def chat_completions():
     if not body:
         return jsonify({"error": {"message": "Invalid JSON body"}}), 400
 
+    # ── Synergy 5: In-chat !router Command (early intercept) ──
+    # Source: eroslifestyle/ai-router-switch src/router_commands.py
+    # Intercept !router commands BEFORE model validation — they never
+    # forward upstream and never consume a token.
+    router_resp, is_router_cmd = _check_router_command(body.get("messages", []))
+    if is_router_cmd:
+        logger.info("!router command intercepted (not forwarded upstream)")
+        return jsonify(router_resp)
+
     # Model mapping with strict validation (Audit Fix: silent fallback to expensive model)
     client_model = body.get("model", DEFAULT_MODEL)
     upstream_model = MODEL_MAP.get(client_model)
@@ -176,10 +334,35 @@ def chat_completions():
         else:
             upstream_model = DEFAULT_MODEL
 
+    # ── Synergy 1: Output-Cap Clamping ──
+    # Source: eequaled/GLM_proxy lib/core.js (clampMaxOutput)
+    # Prevent silent DeepSeek substitution when requesting >131072 output
+    # tokens — AutoClaw cloud silently switches to DeepSeek-V4-Pro (7x
+    # cost). Only clamp if the client explicitly set max_tokens; we never
+    # inflate (only ever reduce to the cap).
+    if "max_tokens" in body and body["max_tokens"] is not None:
+        original_max = body["max_tokens"]
+        body["max_tokens"] = clamp_max_output(client_model, original_max)
+        if body["max_tokens"] < original_max:
+            logger.info(
+                f"Output-cap clamp: {client_model} requested={original_max} "
+                f"-> clamped={body['max_tokens']} (cap={OUTPUT_CAPS.get(upstream_model, OUTPUT_CAPS['default'])})"
+            )
+
     # Force stream=True for upstream (DeepSeek models 500 on non-stream)
     upstream_body = dict(body)
     upstream_body["stream"] = True
     upstream_body["model"] = "x"  # ignored by upstream, but fill it
+
+    # ── Synergy 2: System-Banner Injection ──
+    # Source: eequaled/GLM_proxy lib/core.js (injectSystemBanner)
+    # AutoClaw upstream returns HTTP 400 without this banner; with it,
+    # traffic stays on the metered chat-completions path (reliable).
+    # Copy the messages list so we don't mutate the original request body
+    # (callers may inspect body['messages'] after the response).
+    if isinstance(upstream_body.get("messages"), list):
+        upstream_body["messages"] = list(upstream_body["messages"])
+        _inject_system_banner(upstream_body["messages"])
 
     # Get token (round-robin)
     access_token, acc = get_next_token()
@@ -191,8 +374,26 @@ def chat_completions():
             }
         }), 401
 
-    # Increment request counter for this account
+    # ── Synergy 3: Permanent-Failure Negative Cache ──
+    # Source: eequaled/GLM_proxy lib/core.js (createPermanentFailureCache)
+    # Avoid replaying doomed 30s+ cloud sequences when (model, account) is
+    # known to be permanently failed (quota exhausted, banned, etc.).
     used_email = acc.get("email", "unknown")
+    if is_permanent_failure_cached(upstream_model, used_email):
+        logger.warning(
+            f"Permanent-failure cache hit: model={upstream_model} "
+            f"account={used_email} — returning 429 without forwarding upstream"
+        )
+        return jsonify({
+            "error": {
+                "message": "Account temporarily unavailable (cached permanent "
+                           "failure — wait 60s or run !router refresh-all).",
+                "type": "upstream_error",
+                "code": 429,
+            }
+        }), 429
+
+    # Increment request counter for this account
     _request_counts[used_email] = _request_counts.get(used_email, 0) + 1
 
     headers = _sign_headers()
@@ -216,12 +417,41 @@ def chat_completions():
         )
 
         if upstream_resp.status_code != 200:
-            error_text = upstream_resp.text[:1000]
+            raw_error = upstream_resp.text[:1000]
+            # ── Synergy 4: Chinese → English Error Translation ──
+            # Source: eequaled/GLM_proxy lib/core.js (translateError)
+            # AutoClaw upstream returns Chinese error phrases (积分不足,
+            # 账号封禁, etc.). Translate them to stable English so
+            # international clients can match/switch on them.
+            translated = translate_error(raw_error)
+            if translated != raw_error:
+                logger.info(f"Translated upstream error: '{raw_error[:120]}' -> '{translated[:120]}'")
+            # ── Synergy 3: Mark permanent failures ──
+            # Classify by status code and translated text so the next
+            # request returns 429 immediately (within 60s TTL) without
+            # replaying the doomed cloud sequence.
+            failure_class = None
+            lower_translated = translated.lower()
+            if upstream_resp.status_code in (401, 403) or "auth" in lower_translated:
+                failure_class = "auth_failed"
+            elif upstream_resp.status_code == 404 or "model not found" in lower_translated:
+                failure_class = "model_not_found"
+            elif upstream_resp.status_code == 402 or "insufficient credits" in lower_translated or "quota exhausted" in lower_translated:
+                failure_class = "quota_exhausted"
+            elif "banned" in lower_translated:
+                failure_class = "account_banned"
+            if failure_class:
+                mark_permanent_failure(upstream_model, failure_class, used_email)
+                logger.warning(
+                    f"Marked permanent failure: model={upstream_model} "
+                    f"account={used_email} class={failure_class}"
+                )
             return jsonify({
                 "error": {
-                    "message": f"Upstream error {upstream_resp.status_code}: {error_text}",
+                    "message": f"Upstream error {upstream_resp.status_code}: {translated}",
                     "type": "upstream_error",
                     "code": upstream_resp.status_code,
+                    "failure_class": failure_class,  # None for transient errors
                 }
             }), upstream_resp.status_code
 
@@ -581,7 +811,8 @@ def ledger():
 
 # ── Web UI ──
 
-import os
+# `os` already imported at top of file (Synergy 5: _check_router_command
+# uses os.environ.get for AUTOCLAW_TOKEN_KEY).
 
 from flask import send_from_directory
 
