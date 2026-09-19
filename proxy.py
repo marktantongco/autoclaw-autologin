@@ -49,6 +49,16 @@ from i18n_errors import translate_error
 # ~/.owl-agent install wins over the vendored owl_proxy.py.
 import owl_bridge
 
+# Synergy 9 (Phase 2): per-chat fingerprint isolation + loop_breaker.
+# Source: eroslifestyle/ai-router-switch — SHA-256 of the first user message
+# pinned on first use; loop_breaker 400s re-emit storms at ≥80% context fill.
+import chat_fingerprint
+import loop_breaker
+# Synergy 8 (Phase 2): DSML tool-calling shim.
+# Source: tt-52101/chat-z-ai-proxy-web2api-free — synthesises OpenAI
+# function-calling (buffered + streaming) for tools-less upstreams.
+import dsml_shim
+
 # ─── Structured Logging ──────────────────────────────────────────────
 logger = logging.getLogger("autoclaw.proxy")
 
@@ -79,9 +89,15 @@ _token_exchange_lock = threading.Lock()  # Serialize AutoClaw token exchanges (a
 _request_counts = {}  # email → int
 
 
-def get_next_token():
+def get_next_token(prefer_email=None):
     """Round-robin token selection across all accounts.
-    Auto-refreshes expired tokens. Skips known-exhausted accounts (from cache only)."""
+    Auto-refreshes expired tokens. Skips known-exhausted accounts (from cache only).
+
+    Synergy 9 (Phase 2): when a chat fingerprint is pinned to an account,
+    the caller passes it as prefer_email — that account is tried FIRST so a
+    conversation keeps account affinity; if it is unusable the normal
+    round-robin runs and the caller repins to whoever serves the turn.
+    """
     global _token_idx
     data = load_tokens()
     if not data["accounts"]:
@@ -92,11 +108,28 @@ def get_next_token():
         idx = _token_idx % n
         _token_idx += 1
 
+    from config import ACCESS_TOKEN_TTL, REFRESH_MARGIN
+
+    # ── Synergy 9: pinned-account affinity (tried before round-robin) ──
+    if prefer_email:
+        for acc in data["accounts"]:
+            if acc.get("email") != prefer_email:
+                continue
+            age = time.time() - acc.get("last_refreshed", 0)
+            if age < ACCESS_TOKEN_TTL - REFRESH_MARGIN:
+                if not _is_cached_exhausted(acc):
+                    return acc["access_token"], acc
+            else:
+                from auth import refresh_token
+                new_token = refresh_token(acc)
+                if new_token and not _is_cached_exhausted(acc):
+                    return new_token, acc
+            break  # pinned account found but unusable → round-robin below
+
     # Try each account starting from idx
     for i in range(n):
         acc = data["accounts"][(idx + i) % n]
         # Check token validity
-        from config import ACCESS_TOKEN_TTL, REFRESH_MARGIN
         age = time.time() - acc.get("last_refreshed", 0)
         if age < ACCESS_TOKEN_TTL - REFRESH_MARGIN:
             # Token still valid — check exhausted cache (non-blocking, cached only)
@@ -364,6 +397,32 @@ def chat_completions():
                 f"-> clamped={body['max_tokens']} (cap={OUTPUT_CAPS.get(upstream_model, OUTPUT_CAPS['default'])})"
             )
 
+    # ── Synergy 9 (Phase 2): per-chat fingerprint + loop_breaker ──
+    # Source: eroslifestyle/ai-router-switch. The fingerprint (SHA-256 of
+    # the first user message, or the X-AutoClaw-Chat-Id header) is the unit
+    # of isolation; loop_breaker trips HTTP 400 when the SAME turn is
+    # re-emitted ≥N times at ≥80% context fill (runaway-retry guard).
+    fp = chat_fingerprint.compute_fingerprint(
+        body.get("messages"), request.headers.get("X-AutoClaw-Chat-Id"))
+    if fp:
+        verdict = loop_breaker.check(fp, body.get("messages"), client_model)
+        if verdict:
+            logger.warning(
+                f"loop_breaker trip: fp={fp[:12]}... reemits={verdict['reemits']} "
+                f"fill={verdict['ratio']:.0%} est={verdict['estimated_tokens']}"
+                f"/{verdict['context_window']} — HTTP 400 forced restart"
+            )
+            return jsonify({"error": {
+                "message": (
+                    "Conversation loop detected: this turn was re-emitted "
+                    f"{verdict['reemits']} times at {verdict['ratio']:.0%} of "
+                    "the context window. Start a fresh conversation instead "
+                    "of retrying — further retries will keep failing."),
+                "type": "loop_breaker_triggered",
+                "code": 400,
+                "details": verdict,
+            }}), 400
+
     # Force stream=True for upstream (DeepSeek models 500 on non-stream)
     upstream_body = dict(body)
     upstream_body["stream"] = True
@@ -379,8 +438,30 @@ def chat_completions():
         upstream_body["messages"] = list(upstream_body["messages"])
         _inject_system_banner(upstream_body["messages"])
 
-    # Get token (round-robin)
-    access_token, acc = get_next_token()
+    # ── Synergy 8 (Phase 2): DSML tool-calling shim (request side) ──
+    # Source: tt-52101/chat-z-ai-proxy-web2api-free. When the client sends
+    # OpenAI `tools`, describe them in a DSML protocol block appended after
+    # the AutoClaw banner; the response side parses <dsml:tool_call> blocks
+    # back into real tool_calls. tool_choice="none" disables the shim.
+    tools = body.get("tools")
+    dsml_active = bool(
+        dsml_shim.enabled()
+        and isinstance(tools, list) and tools
+        and body.get("tool_choice") != "none"
+    )
+    if dsml_active and isinstance(upstream_body.get("messages"), list):
+        dsml_shim.inject_tool_protocol(
+            upstream_body["messages"], tools, body.get("tool_choice"))
+        logger.info(
+            f"DSML shim active: {len(tools)} tool(s), "
+            f"tool_choice={body.get('tool_choice', 'auto')}")
+
+    # Get token (round-robin, with Synergy 9 pinned-account affinity)
+    pinned_email = chat_fingerprint.pinned_email(fp) if fp else None
+    if pinned_email:
+        access_token, acc = get_next_token(prefer_email=pinned_email)
+    else:
+        access_token, acc = get_next_token()
     if not access_token:
         return jsonify({
             "error": {
@@ -388,6 +469,15 @@ def chat_completions():
                 "type": "auth_error",
             }
         }), 401
+
+    # ── Synergy 9: pin-on-first-use / repin-on-drift ──
+    if fp and acc:
+        served_email = acc.get("email", "unknown")
+        chat_fingerprint.bind(fp, served_email)
+        if pinned_email and served_email != pinned_email:
+            logger.info(
+                f"Chat fingerprint repinned: fp={fp[:12]}... "
+                f"{pinned_email} → {served_email} (pinned account unusable)")
 
     # ── Synergy 3: Permanent-Failure Negative Cache ──
     # Source: eequaled/GLM_proxy lib/core.js (createPermanentFailureCache)
@@ -494,21 +584,38 @@ def chat_completions():
 
         if client_wants_stream:
             # Pass through SSE stream — filter reasoning, only forward content chunks
+            # Synergy 8 (Phase 2): when the DSML shim is active, content deltas
+            # flow through a StreamSieve that forwards prose immediately, holds
+            # back possible <dsml:tool_call> starts, and converts completed
+            # blocks into OpenAI streaming tool_calls deltas.
+            sieve = dsml_shim.DSMLStreamSieve() if dsml_active else None
+
+            def _sse(piece):
+                return b"data: " + json.dumps(
+                    {"choices": [{"index": 0, "delta": piece,
+                                  "finish_reason": None}]}).encode() + b"\n\n"
+
             def generate():
                 for line in upstream_resp.iter_lines():
                     if line:
                         if line.startswith(b"data:"):
                             raw = line[5:].strip()
                             if raw == b"[DONE]":
-                                yield line + b"\n\n"
                                 # v2.1.0 fix: upstream [DONE] previously fell
                                 # through and the generator appended a SECOND
                                 # [DONE] — duplicate terminator confused some
                                 # strict OpenAI clients.
+                                # v2.2.0: drain any held-back DSML tail first.
+                                if sieve is not None:
+                                    for piece in sieve.flush():
+                                        yield _sse(piece)
+                                yield line + b"\n\n"
                                 return
                             try:
                                 chunk = json.loads(raw)
                                 choices = chunk.get("choices", [])
+                                pieces = []
+                                carry = False
                                 if choices:
                                     delta = choices[0].get("delta", {})
                                     # Strip reasoning fields — Cline/OpenAI clients don't understand them
@@ -518,17 +625,35 @@ def chat_completions():
                                         del delta["reasoning_details"]
                                     if "reasoning_content" in delta:
                                         del delta["reasoning_content"]
+                                    # ── Synergy 8: DSML sieve (content only) ──
+                                    # Native tool_calls deltas pass through
+                                    # untouched; only textual content is sieved.
+                                    if sieve is not None:
+                                        if delta.get("content"):
+                                            pieces = sieve.feed(
+                                                delta.pop("content"))
+                                        if choices[0].get("finish_reason"):
+                                            pieces += sieve.flush()
+                                            if sieve.saw_tool_calls:
+                                                # synthesised calls arrived —
+                                                # fix the terminal reason
+                                                choices[0]["finish_reason"] = "tool_calls"
                                     # Skip chunks with empty content and no tool_calls (pure thinking)
                                     has_content = bool(delta.get("content"))
                                     has_tool_calls = bool(delta.get("tool_calls"))
                                     has_finish = bool(choices[0].get("finish_reason"))
                                     # Only forward if there's actual content/tool_calls/finish
-                                    if not has_content and not has_tool_calls and not has_finish:
-                                        continue
-                                    # Clean native_finish_reason
-                                    if "native_finish_reason" in choices[0]:
-                                        del choices[0]["native_finish_reason"]
-                                yield b"data: " + json.dumps(chunk).encode() + b"\n\n"
+                                    carry = has_content or has_tool_calls or has_finish
+                                    if carry or has_finish:
+                                        # Clean native_finish_reason
+                                        if "native_finish_reason" in choices[0]:
+                                            del choices[0]["native_finish_reason"]
+                                # Emit sieve pieces first — they carry text that
+                                # streamed in BEFORE this chunk arrived.
+                                for piece in pieces:
+                                    yield _sse(piece)
+                                if carry:
+                                    yield b"data: " + json.dumps(chunk).encode() + b"\n\n"
                             except (json.JSONDecodeError, KeyError):
                                 yield line + b"\n\n"
                 yield b"data: [DONE]\n\n"
@@ -546,6 +671,7 @@ def chat_completions():
             full_tool_calls = []
             finish_reason = None
             model_name = upstream_model
+            usage = None
 
             for line in upstream_resp.iter_lines():
                 if not line:
@@ -586,11 +712,27 @@ def chat_completions():
                     except json.JSONDecodeError:
                         pass
 
-            message = {"role": "assistant", "content": full_content if full_content else None}
-            if full_tool_calls:
-                message["tool_calls"] = full_tool_calls
-                if not finish_reason:
-                    finish_reason = "tool_calls"
+            # ── Synergy 8 (Phase 2): DSML buffered parse ──
+            # When the client sent tools and the upstream produced no native
+            # tool_calls, convert any <dsml:tool_call> blocks in the reply
+            # into a real OpenAI tool_calls message.
+            dsml_result = None
+            if dsml_active and not full_tool_calls:
+                dsml_result = dsml_shim.parse_dsml(full_content)
+
+            message = {"role": "assistant", "content": None}
+            if dsml_result:
+                message["content"] = dsml_result["content"] or None
+                message["tool_calls"] = dsml_result["tool_calls"]
+                # upstream said "stop" because its TEXT finished; the client
+                # must see "tool_calls" to dispatch the synthesised calls
+                finish_reason = "tool_calls"
+            else:
+                message["content"] = full_content if full_content else None
+                if full_tool_calls:
+                    message["tool_calls"] = full_tool_calls
+                    if not finish_reason:
+                        finish_reason = "tool_calls"
 
             response = {
                 "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -602,9 +744,12 @@ def chat_completions():
                     "message": message,
                     "finish_reason": finish_reason or "stop",
                 }],
-                "usage": usage if 'usage' in dir() else {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
             }
-            return jsonify(response)
+            resp = jsonify(response)
+            if dsml_result:
+                resp.headers["X-DSML-Shim"] = "1"
+            return resp
 
     except req_lib.exceptions.Timeout:
         return jsonify({"error": {"message": "Upstream timeout"}}), 504
@@ -637,6 +782,11 @@ def health():
         "version": VERSION,
         # Synergy 6: OWL-AGENT proxy defense layer stats (never raises)
         "owl": owl_bridge.owl_stats(),
+        # Synergy 9 (Phase 2): per-chat fingerprint + loop_breaker (ai-router-switch)
+        "fingerprint": chat_fingerprint.stats(),
+        "loop_breaker": loop_breaker.stats(),
+        # Synergy 8 (Phase 2): DSML tool-calling shim (chat-z-ai-proxy)
+        "dsml": dsml_shim.stats(),
     })
 
 

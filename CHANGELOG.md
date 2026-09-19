@@ -1,6 +1,83 @@
 # Changelog
 
+## v2.2.0 — Phase 2: DSML Tool-Calling Shim + Per-Chat Fingerprint + loop_breaker (2026-09-20)
+
+**Synergies implemented:** #8 DSML tool-calling shim
+(tt-52101/chat-z-ai-proxy-web2api-free) and #9 per-chat fingerprint
+isolation + loop_breaker (eroslifestyle/ai-router-switch), per the
+AutoClaw Ecosystem Synergy Research Deep-Dive roadmap (items 2.3, 2.4,
+2.5).
+
+### Added
+
+- **`dsml_shim.py` (Synergy 8)** — synthesises OpenAI function-calling for
+  the upstream, which lacks a native tool API:
+  - Request side: when the client sends `tools`, a DSML (Domain-Specific
+    Markup Language) protocol block is appended after the AutoClaw banner
+    describing every tool (name, description, JSON-schema parameters) plus
+    the exact `<dsml:tool_call>` markup the model must emit
+  - Buffered response side: regex parse converts DSML blocks into real
+    `message.tool_calls` (`finish_reason: "tool_calls"`, `X-DSML-Shim: 1`
+    response header); prose outside blocks stays as `content`
+  - Streaming response side: `DSMLStreamSieve` state machine forwards prose
+    immediately, holds back possible tag starts, and converts completed
+    blocks into OpenAI streaming `tool_calls` deltas (id/name delta +
+    arguments delta) — DSML markup never leaks to clients
+  - `tool_choice` honoured: `"none"` disables the shim, `"required"` /
+    forced-function add mandate lines; native upstream tool_calls (when the
+    upstream emits them) pass through untouched
+  - Tolerant parsing: case-insensitive tags, optional ids (minted when
+    absent), pretty-printed arguments repaired to single-line JSON,
+    truncated blocks degrade to prose at end-of-stream
+- **`chat_fingerprint.py` (Synergy 9a)** — per-chat fingerprint isolation:
+  - SHA-256 of the FIRST user message (later turns never re-mint identity),
+    or the `X-AutoClaw-Chat-Id` request header when the client wants
+    explicit control
+  - Pin-on-first-use to the serving account: follow-up turns of the same
+    conversation reuse that account (affinity via
+    `get_next_token(prefer_email=...)`); repin-on-drift when the pinned
+    account turns unusable
+  - TTL (24 h default) + LRU capacity (10 000 chats) + thread-safe
+- **`loop_breaker.py` (Synergy 9b, depends on the fingerprint)** —
+  stuck-conversation guard:
+  - Counts re-emits of the SAME turn (last-user-message hash) at >=80%
+    context fill; 4th re-emit returns HTTP 400 `loop_breaker_triggered`
+    forcing a clean restart instead of runaway token spend
+  - New turn resets the streak — legitimate long conversations are never
+    killed; per-model context-window table with
+    `AUTOCLAW_CONTEXT_WINDOW` global override
+- **Observability:** `/health` now exposes `fingerprint`, `loop_breaker`
+  and `dsml` stat blocks
+- **Tests:** suite grows 61 -> 112 offline tests (fingerprint unit +
+  thread-safety, loop_breaker trip/reset/window mapping, DSML protocol /
+  parse / StreamSieve, Flask route integration incl. streaming DSML with
+  markup-leak check, affinity, chat-id header, loop 400)
+
+### Changed
+
+- `get_next_token()` accepts `prefer_email` (pinned-account affinity;
+  round-robin unchanged when no pin exists)
+- Buffered non-stream aggregation initialises `usage` explicitly
+  (replaces the `'usage' in dir()` idiom)
+- Test fixture resets Phase-2 singletons and accepts kwargs in the token
+  stub
+
+### Env knobs
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTOCLAW_DSML_ENABLED` | `1` | DSML tool-calling shim master switch |
+| `AUTOCLAW_FINGERPRINT_ENABLED` | `1` | Per-chat fingerprint isolation |
+| `AUTOCLAW_FINGERPRINT_TTL` | `86400` | Pin lifetime (s) |
+| `AUTOCLAW_FINGERPRINT_MAX` | `10000` | LRU capacity |
+| `AUTOCLAW_LOOP_BREAKER_ENABLED` | `1` | loop_breaker master switch |
+| `AUTOCLAW_LOOP_REEMITS` | `4` | Re-emits before trip |
+| `AUTOCLAW_LOOP_RATIO` | `0.8` | Context-fill threshold |
+| `AUTOCLAW_LOOP_TTL` | `3600` | Streak memory (s) |
+| `AUTOCLAW_CONTEXT_WINDOW` | *(per-model)* | Global context-window override |
+
 ## v2.1.0 — OWL-AGENT Proxy Defense Integration (2026-09-19)
+ — OWL-AGENT Proxy Defense Integration (2026-09-19)
 
 **Synergy implemented:** OWL-AGENT v5.3 proxy defense stack (user-provided
 unified installer) integrated into AutoClaw as the upstream network-resilience

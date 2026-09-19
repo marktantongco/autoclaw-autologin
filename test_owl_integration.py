@@ -1,4 +1,4 @@
-"""AutoClaw v2.1.0 — OWL-AGENT integration + Phase-1 synergy regression tests.
+"""AutoClaw v2.2.0 — OWL-AGENT integration + Phase-1/Phase-2 synergy tests.
 
 Run:  python -m pytest test_owl_integration.py -v
 
@@ -23,6 +23,11 @@ from owl_proxy import (
 )
 import owl_bridge
 from owl_bridge import OwlResponse, OwlStreamResponse, OwlUnavailable
+
+# Phase-2 modules (Synergy 8 + 9)
+import chat_fingerprint
+import loop_breaker
+import dsml_shim
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -731,8 +736,11 @@ def flask_env(monkeypatch, tmp_path):
     import proxy
     from cache import clear_permanent_failures
     clear_permanent_failures()  # singleton must not leak across tests
+    # Phase-2 singletons must not leak across tests either
+    chat_fingerprint.reset()
+    loop_breaker.reset()
     monkeypatch.setattr(proxy, "get_next_token",
-                        lambda: ("fake-token", {"email": "t@x", "access_token": "fake-token"}))
+                        lambda *a, **kw: ("fake-token", {"email": "t@x", "access_token": "fake-token"}))
     monkeypatch.setattr(proxy, "load_tokens", lambda: {"accounts": []})
     return proxy
 
@@ -756,7 +764,7 @@ class TestChatRoutes:
         body = r.get_json()
         assert body["status"] == "ok"
         assert "owl" in body and body["owl"]["enabled"] is False
-        assert body["version"] == "2.1.0"
+        assert body["version"] == "2.2.0"
 
     def test_router_command_still_intercepted(self, client):
         r = client.post("/v1/chat/completions",
@@ -889,3 +897,562 @@ class TestAuthUpstreamRouting:
         monkeypatch.setattr(auth_mod.requests, "request", fake_request)
         resp = auth_mod._upstream_request("GET", "https://upstream.test/wallet")
         assert resp.json()["via"] == "direct" and seen["direct"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 2 — Synergy 9: per-chat fingerprint isolation (ai-router-switch)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestChatFingerprint:
+    def setup_method(self):
+        chat_fingerprint.reset()
+
+    def _msgs(self, first="hello world", extra=None):
+        msgs = [{"role": "user", "content": first}]
+        if extra:
+            msgs += extra
+        return msgs
+
+    def test_same_first_message_same_fingerprint(self):
+        a = chat_fingerprint.compute_fingerprint(self._msgs())
+        b = chat_fingerprint.compute_fingerprint(self._msgs())
+        assert a == b and len(a) == 64
+
+    def test_different_first_message_different_fingerprint(self):
+        a = chat_fingerprint.compute_fingerprint(self._msgs("alpha"))
+        b = chat_fingerprint.compute_fingerprint(self._msgs("beta"))
+        assert a != b
+
+    def test_later_messages_do_not_change_identity(self):
+        base = chat_fingerprint.compute_fingerprint(self._msgs())
+        grown = chat_fingerprint.compute_fingerprint(self._msgs(extra=[
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "follow-up"},
+        ]))
+        assert base == grown
+
+    def test_multimodal_text_parts_hashed(self):
+        plain = chat_fingerprint.compute_fingerprint(self._msgs("see pic"))
+        mm = chat_fingerprint.compute_fingerprint([{"role": "user", "content": [
+            {"type": "text", "text": "see pic"},
+            {"type": "image_url", "image_url": {"url": "data:..."}}]}])
+        assert plain == mm
+
+    def test_client_chat_id_overrides_content(self):
+        via_id = chat_fingerprint.compute_fingerprint(self._msgs(), "chat-42")
+        via_content = chat_fingerprint.compute_fingerprint(self._msgs())
+        again = chat_fingerprint.compute_fingerprint(self._msgs("OTHER"), "chat-42")
+        assert via_id != via_content
+        assert via_id == again  # header beats content
+
+    def test_empty_or_userless_messages_no_fingerprint(self):
+        assert chat_fingerprint.compute_fingerprint([]) is None
+        assert chat_fingerprint.compute_fingerprint(
+            [{"role": "system", "content": "x"}]) is None
+        assert chat_fingerprint.compute_fingerprint(None) is None
+
+    def test_disabled_flag_returns_none(self, monkeypatch):
+        monkeypatch.setattr(chat_fingerprint, "_ENABLED", False)
+        assert chat_fingerprint.compute_fingerprint(self._msgs()) is None
+
+    def test_pin_on_first_use_and_touch(self):
+        fp = chat_fingerprint.compute_fingerprint(self._msgs())
+        assert chat_fingerprint.pinned_email(fp) is None
+        assert chat_fingerprint.bind(fp, "a@x") == "a@x"
+        assert chat_fingerprint.bind(fp, "a@x") == "a@x"
+        assert chat_fingerprint.pinned_email(fp) == "a@x"
+
+    def test_repin_on_drift(self):
+        """Pinned account unusable → pin follows the account that served."""
+        fp = chat_fingerprint.compute_fingerprint(self._msgs())
+        chat_fingerprint.bind(fp, "a@x")
+        chat_fingerprint.bind(fp, "b@x")
+        assert chat_fingerprint.pinned_email(fp) == "b@x"
+
+    def test_ttl_expiry_lazily_evicts(self, monkeypatch):
+        monkeypatch.setattr(chat_fingerprint, "_TTL", 0)
+        fp = chat_fingerprint.compute_fingerprint(self._msgs())
+        chat_fingerprint.bind(fp, "a@x")
+        assert chat_fingerprint.pinned_email(fp) is None
+
+    def test_lru_capacity_eviction(self, monkeypatch):
+        monkeypatch.setattr(chat_fingerprint, "_MAX", 2)
+        fps = [chat_fingerprint.compute_fingerprint(self._msgs(f"m{i}"))
+               for i in range(3)]
+        for i, fp in enumerate(fps):
+            chat_fingerprint.bind(fp, f"acc{i}@x")
+        assert chat_fingerprint.pinned_email(fps[0]) is None   # evicted
+        assert chat_fingerprint.pinned_email(fps[2]) == "acc2@x"
+
+    def test_unpin_and_stats(self):
+        fp = chat_fingerprint.compute_fingerprint(self._msgs())
+        chat_fingerprint.bind(fp, "a@x")
+        chat_fingerprint.bind(fp, "a@x")
+        s = chat_fingerprint.stats()
+        assert s["pinned_chats"] == 1 and s["turns_served"] == 2
+        chat_fingerprint.unpin(fp)
+        assert chat_fingerprint.pinned_email(fp) is None
+
+    def test_bind_thread_safety_smoke(self):
+        fp = chat_fingerprint.compute_fingerprint(self._msgs("threaded"))
+        errors = []
+        def worker(n):
+            try:
+                for _ in range(50):
+                    chat_fingerprint.bind(fp, f"acc{n}@x")
+            except Exception as e:  # pragma: no cover
+                errors.append(e)
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        assert not errors
+        assert chat_fingerprint.pinned_email(fp) is not None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 2 — Synergy 9: loop_breaker (ai-router-switch)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestLoopBreaker:
+    def setup_method(self):
+        loop_breaker.reset()
+
+    def test_four_reemits_trip_block(self, monkeypatch):
+        monkeypatch.setattr(loop_breaker, "_RATIO", 0.01)
+        monkeypatch.setattr(loop_breaker, "_WINDOW_OVERRIDE", "100")
+        fp = "f" * 64
+        msgs = [{"role": "user", "content": "retry loop payload"}]
+        assert loop_breaker.check(fp, msgs, "cheap") is None       # emit 1
+        assert loop_breaker.check(fp, msgs, "cheap") is None       # emit 2
+        assert loop_breaker.check(fp, msgs, "cheap") is None       # emit 3
+        verdict = loop_breaker.check(fp, msgs, "cheap")            # emit 4
+        assert verdict and verdict["action"] == "block"
+        assert verdict["reemits"] == 4
+        assert verdict["estimated_tokens"] >= 1
+
+    def test_small_requests_never_count(self):
+        fp = "f" * 64
+        msgs = [{"role": "user", "content": "tiny"}]
+        for _ in range(10):
+            assert loop_breaker.check(fp, msgs, "cheap") is None
+
+    def test_new_turn_resets_streak(self, monkeypatch):
+        monkeypatch.setattr(loop_breaker, "_RATIO", 0.01)
+        monkeypatch.setattr(loop_breaker, "_WINDOW_OVERRIDE", "100")
+        fp = "f" * 64
+        m1 = [{"role": "user", "content": "first huge turn"}]
+        for _ in range(3):
+            loop_breaker.check(fp, m1, "cheap")
+        m2 = [{"role": "user", "content": "a genuinely NEW turn"}]
+        # m2's own streak starts at zero — m1's 3 re-emits don't carry over
+        assert loop_breaker.check(fp, m2, "cheap") is None
+        assert loop_breaker.check(fp, m2, "cheap") is None
+        assert loop_breaker.check(fp, m2, "cheap") is None
+        v = loop_breaker.check(fp, m2, "cheap")   # 4th emit of m2 → trips
+        assert v and v["reemits"] == 4
+
+    def test_no_fingerprint_no_tracking(self):
+        assert loop_breaker.check(None, [{"role": "user", "content": "x"}]) is None
+
+    def test_disabled_returns_none(self, monkeypatch):
+        monkeypatch.setattr(loop_breaker, "_ENABLED", False)
+        monkeypatch.setattr(loop_breaker, "_RATIO", 0.01)
+        monkeypatch.setattr(loop_breaker, "_WINDOW_OVERRIDE", "100")
+        for _ in range(6):
+            assert loop_breaker.check(
+                "f" * 64, [{"role": "user", "content": "x"}], "cheap") is None
+
+    def test_model_window_mapping_differs(self, monkeypatch):
+        """cheap (65536 window) counts a ~700-token turn; glm-5.2 (131072) doesn't."""
+        monkeypatch.setattr(loop_breaker, "_RATIO", 0.01)
+        monkeypatch.setattr(loop_breaker, "_WINDOW_OVERRIDE", "")
+        msgs = [{"role": "user", "content": "x" * 2800}]  # ~701 tokens
+        v_turbo = None
+        for _ in range(4):
+            v_turbo = loop_breaker.check("a" * 64, list(msgs), "cheap")
+        v_52 = None
+        for _ in range(6):
+            v_52 = loop_breaker.check("b" * 64, list(msgs), "glm-5.2")
+        assert v_turbo and v_turbo["context_window"] == 65536   # 0.0107 fill counts
+        assert v_52 is None                                     # 0.0053 fill never trips
+
+    def test_release_clears_streak(self, monkeypatch):
+        monkeypatch.setattr(loop_breaker, "_RATIO", 0.01)
+        monkeypatch.setattr(loop_breaker, "_WINDOW_OVERRIDE", "100")
+        fp = "f" * 64
+        msgs = [{"role": "user", "content": "retry loop payload"}]
+        for _ in range(4):
+            loop_breaker.check(fp, msgs, "cheap")
+        loop_breaker.release(fp)
+        assert loop_breaker.check(fp, msgs, "cheap") is None  # fresh streak
+
+    def test_stats_counts_blocks(self, monkeypatch):
+        monkeypatch.setattr(loop_breaker, "_RATIO", 0.01)
+        monkeypatch.setattr(loop_breaker, "_WINDOW_OVERRIDE", "100")
+        fp = "f" * 64
+        msgs = [{"role": "user", "content": "retry loop payload"}]
+        for _ in range(5):
+            loop_breaker.check(fp, msgs, "cheap")
+        assert loop_breaker.stats()["blocks_served"] >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 2 — Synergy 8: DSML tool-calling shim (chat-z-ai-proxy)
+# ═══════════════════════════════════════════════════════════════════
+
+TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {"location": {"type": "string"}},
+            "required": ["location"],
+        },
+    },
+}]
+
+DSML_BLOCK = ('<dsml:tool_call id="call_1">'
+              '<dsml:function>get_weather</dsml:function>'
+              '<dsml:arguments>{"location": "Tokyo"}</dsml:arguments>'
+              '</dsml:tool_call>')
+
+
+def _dsml_marker():
+    return "## Tool Calling Protocol (DSML)"
+
+
+class TestDSMLProtocol:
+    def test_protocol_lists_tools_and_rules(self):
+        text = dsml_shim.build_tool_protocol(TOOLS)
+        assert "get_weather" in text
+        assert "dsml:tool_call" in text
+        assert "dsml:function" in text
+        tools_json = text.split("<dsml:tools>")[1].split("</dsml:tools>")[0]
+        parsed = json.loads(tools_json)
+        assert parsed[0]["name"] == "get_weather"
+        assert parsed[0]["parameters"]["required"] == ["location"]
+
+    def test_required_choice_mandates(self):
+        assert "MUST invoke at least one tool" in dsml_shim.build_tool_protocol(TOOLS, "required")
+
+    def test_forced_function_choice(self):
+        text = dsml_shim.build_tool_protocol(
+            TOOLS, {"type": "function", "function": {"name": "get_weather"}})
+        assert 'MUST invoke the tool "get_weather"' in text
+
+    def test_auto_choice_no_mandate(self):
+        text = dsml_shim.build_tool_protocol(TOOLS, "auto")
+        assert "You MUST invoke" not in text
+
+    def test_inject_appends_to_existing_system(self):
+        msgs = [{"role": "system", "content": "base prompt"},
+                {"role": "user", "content": "u"}]
+        dsml_shim.inject_tool_protocol(msgs, TOOLS)
+        assert msgs[0]["content"].startswith("base prompt")
+        assert _dsml_marker() in msgs[0]["content"]
+        dsml_shim.inject_tool_protocol(msgs, TOOLS)  # idempotent
+        assert msgs[0]["content"].count(_dsml_marker()) == 1
+
+    def test_inject_creates_system_when_absent(self):
+        msgs = [{"role": "user", "content": "u"}]
+        dsml_shim.inject_tool_protocol(msgs, TOOLS)
+        assert msgs[0]["role"] == "system"
+        assert _dsml_marker() in msgs[0]["content"]
+
+    def test_inject_keeps_banner_first(self):
+        """Banner must stay at the very start (upstream metered-path rule)."""
+        from proxy import _inject_system_banner
+        msgs = [{"role": "user", "content": "u"}]
+        _inject_system_banner(msgs)
+        dsml_shim.inject_tool_protocol(msgs, TOOLS)
+        assert msgs[0]["content"].startswith("You are a personal assistant")
+
+
+class TestDSMLParse:
+    def test_single_call(self):
+        res = dsml_shim.parse_dsml("Before " + DSML_BLOCK + " after")
+        assert res and len(res["tool_calls"]) == 1
+        tc = res["tool_calls"][0]
+        assert tc["id"] == "call_1"
+        assert tc["type"] == "function"
+        assert tc["function"]["name"] == "get_weather"
+        assert json.loads(tc["function"]["arguments"]) == {"location": "Tokyo"}
+        assert res["content"] == "Before  after"
+
+    def test_multiple_calls_unique_ids(self):
+        two = DSML_BLOCK + DSML_BLOCK.replace('id="call_1"', 'id="call_2"')
+        res = dsml_shim.parse_dsml(two)
+        assert res and len(res["tool_calls"]) == 2
+        assert {tc["id"] for tc in res["tool_calls"]} == {"call_1", "call_2"}
+
+    def test_missing_id_minted(self):
+        block = DSML_BLOCK.replace(' id="call_1"', '')
+        res = dsml_shim.parse_dsml(block)
+        assert res["tool_calls"][0]["id"].startswith("call_")
+
+    def test_pretty_printed_args_repaired(self):
+        block = ('<dsml:tool_call><dsml:function>get_weather</dsml:function>'
+                 '<dsml:arguments>{\n  "location": "Oslo"\n}</dsml:arguments>'
+                 '</dsml:tool_call>')
+        res = dsml_shim.parse_dsml(block)
+        assert json.loads(res["tool_calls"][0]["function"]["arguments"]) == {
+            "location": "Oslo"}
+
+    def test_case_insensitive_tags(self):
+        res = dsml_shim.parse_dsml(DSML_BLOCK.upper())
+        assert res and res["tool_calls"][0]["function"]["name"] == "GET_WEATHER"
+
+    def test_block_without_function_dropped(self):
+        bad = '<dsml:tool_call><dsml:arguments>{}</dsml:arguments></dsml:tool_call>'
+        assert dsml_shim.parse_dsml(bad) is None
+
+    def test_no_blocks_returns_none(self):
+        assert dsml_shim.parse_dsml("just prose, no markup at all") is None
+        assert dsml_shim.parse_dsml("") is None
+        assert dsml_shim.parse_dsml(None) is None
+
+
+class TestDSMLSieve:
+    def _feed_all(self, sieve, text, step=7):
+        pieces = []
+        for i in range(0, len(text), step):
+            pieces += sieve.feed(text[i:i + step])
+        pieces += sieve.flush()
+        return pieces
+
+    @staticmethod
+    def _render(pieces):
+        out, calls = "", []
+        for p in pieces:
+            if "content" in p:
+                out += p["content"]
+            else:
+                calls += p["tool_calls"]
+        return out, calls
+
+    def test_plain_text_passes_through(self):
+        sieve = dsml_shim.DSMLStreamSieve()
+        text = "The quick brown fox < jumps over <b>the</b> lazy dog."
+        out, calls = self._render(self._feed_all(sieve, text))
+        assert out == text and calls == []
+        assert not sieve.saw_tool_calls
+
+    def test_block_split_across_feeds(self):
+        sieve = dsml_shim.DSMLStreamSieve()
+        pieces = self._feed_all(sieve, DSML_BLOCK, step=5)
+        out, calls = self._render(pieces)
+        assert out == ""
+        assert len(calls) == 2  # id/name delta + arguments delta
+        first, second = calls
+        assert first["id"] == "call_1"
+        assert first["function"]["name"] == "get_weather"
+        assert json.loads(second["function"]["arguments"]) == {"location": "Tokyo"}
+        assert sieve.saw_tool_calls
+
+    def test_prose_then_block(self):
+        sieve = dsml_shim.DSMLStreamSieve()
+        out, calls = self._render(self._feed_all(sieve, "Let me check. " + DSML_BLOCK))
+        assert out == "Let me check. "
+        assert calls and calls[0]["function"]["name"] == "get_weather"
+
+    def test_two_calls_indexed(self):
+        sieve = dsml_shim.DSMLStreamSieve()
+        two = DSML_BLOCK + DSML_BLOCK.replace('id="call_1"', 'id="call_2"')
+        _, calls = self._render(self._feed_all(sieve, two))
+        idxs = [c["index"] for c in calls if "index" in c]
+        assert sorted(set(idxs)) == [0, 1]
+
+    def test_truncated_block_degrades_to_prose(self):
+        sieve = dsml_shim.DSMLStreamSieve()
+        raw = "text <dsml:tool_call><dsml:function>x</dsml:function>"
+        out, calls = self._render(self._feed_all(sieve, raw))
+        assert out == raw and calls == []
+
+    def test_flush_idempotent(self):
+        sieve = dsml_shim.DSMLStreamSieve()
+        assert self._render(sieve.flush())[0] == ""
+        fed = self._render(sieve.feed("hello<"))[0]    # "hello" released now
+        flushed = self._render(sieve.flush())[0]       # "<" was held back
+        assert fed + flushed == "hello<"
+        assert sieve.flush() == []                     # second flush drains nothing
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 2 — Flask route integration (fingerprint, loop_breaker, DSML)
+# ═══════════════════════════════════════════════════════════════════
+
+def _sse_line(obj):
+    return ("data: " + json.dumps(obj)).encode() + b"\n\n"
+
+
+def _dsml_upstream_lines(text_chunks, finish="stop"):
+    lines = []
+    for c in text_chunks:
+        lines.append(_sse_line({"choices": [{"delta": {"content": c}}]}))
+    lines.append(_sse_line({"choices": [{"delta": {},
+                                         "finish_reason": finish}]}))
+    lines.append(b"data: [DONE]\n\n")
+    return lines
+
+
+class TestPhase2Routes:
+    def test_health_has_phase2_blocks(self, client):
+        r = client.get("/health")
+        body = r.get_json()
+        assert body["fingerprint"]["enabled"] is True
+        assert body["loop_breaker"]["enabled"] is True
+        assert body["dsml"]["enabled"] is True
+
+    def test_buffered_dsml_tool_call(self, client, flask_env, monkeypatch):
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        monkeypatch.setattr(
+            flask_env.req_lib, "post",
+            lambda *a, **kw: FakeRequestsSSE(200, _dsml_upstream_lines(["Sure! " + DSML_BLOCK])))
+        r = client.post("/v1/chat/completions", json={
+            "model": "cheap", "stream": False,
+            "messages": [{"role": "user", "content": "weather in Tokyo?"}],
+            "tools": TOOLS})
+        assert r.status_code == 200
+        assert r.headers["X-DSML-Shim"] == "1"
+        body = r.get_json()
+        msg = body["choices"][0]["message"]
+        assert body["choices"][0]["finish_reason"] == "tool_calls"
+        assert msg["content"] == "Sure!"
+        tc = msg["tool_calls"][0]
+        assert tc["function"]["name"] == "get_weather"
+        assert json.loads(tc["function"]["arguments"]) == {"location": "Tokyo"}
+
+    def test_streaming_dsml_tool_call(self, client, flask_env, monkeypatch):
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        block = "Sure! " + DSML_BLOCK
+        chunks = [block[:20], block[20:45], block[45:]]
+        monkeypatch.setattr(
+            flask_env.req_lib, "post",
+            lambda *a, **kw: FakeRequestsSSE(200, _dsml_upstream_lines(chunks)))
+        r = client.post("/v1/chat/completions", json={
+            "model": "cheap", "stream": True,
+            "messages": [{"role": "user", "content": "weather in Tokyo?"}],
+            "tools": TOOLS})
+        assert r.status_code == 200
+        data = r.data
+        assert b'"tool_calls"' in data
+        assert b"get_weather" in data
+        assert b"<dsml:" not in data          # markup never leaks to clients
+        assert b'"finish_reason": "tool_calls"' in data
+        assert b"Sure!" in data
+
+    def test_tool_choice_none_skips_shim(self, client, flask_env, monkeypatch):
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        captured = {}
+        def fake_post(url, **kw):
+            captured.update(json=kw.get("json"))
+            return FakeRequestsSSE(200, _dsml_upstream_lines(["hi"]))
+        monkeypatch.setattr(flask_env.req_lib, "post", fake_post)
+        r = client.post("/v1/chat/completions", json={
+            "model": "cheap", "stream": False,
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": TOOLS, "tool_choice": "none"})
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["choices"][0]["message"]["content"] == "hi"
+        assert "tool_calls" not in body["choices"][0]["message"]
+        assert b"dsml" not in json.dumps(captured["json"]).encode()
+
+    def test_loop_breaker_400_on_reemit_storm(self, client, flask_env, monkeypatch):
+        monkeypatch.setattr(loop_breaker, "_RATIO", 0.01)
+        monkeypatch.setattr(loop_breaker, "_WINDOW_OVERRIDE", "100")
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        monkeypatch.setattr(
+            flask_env.req_lib, "post",
+            lambda *a, **kw: FakeRequestsSSE(200, _dsml_upstream_lines(["ok"])))
+        payload = {"model": "cheap", "stream": False,
+                   "messages": [{"role": "user", "content": "retry loop payload"}]}
+        for _ in range(3):
+            assert client.post("/v1/chat/completions", json=payload).status_code == 200
+        r = client.post("/v1/chat/completions", json=payload)
+        assert r.status_code == 400
+        err = r.get_json()["error"]
+        assert err["type"] == "loop_breaker_triggered"
+        assert err["details"]["reemits"] == 4
+
+    def test_loop_breaker_allows_new_turn(self, client, flask_env, monkeypatch):
+        monkeypatch.setattr(loop_breaker, "_RATIO", 0.01)
+        monkeypatch.setattr(loop_breaker, "_WINDOW_OVERRIDE", "100")
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        monkeypatch.setattr(
+            flask_env.req_lib, "post",
+            lambda *a, **kw: FakeRequestsSSE(200, _dsml_upstream_lines(["ok"])))
+        for _ in range(3):
+            r = client.post("/v1/chat/completions", json={
+                "model": "cheap", "stream": False,
+                "messages": [{"role": "user", "content": "turn one payload"}]})
+            assert r.status_code == 200
+        r = client.post("/v1/chat/completions", json={
+            "model": "cheap", "stream": False,
+            "messages": [{"role": "user", "content": "a brand new turn"}]})
+        assert r.status_code == 200  # streak reset — new turn never blocked
+
+    def test_fingerprint_affinity_prefers_pinned_account(self, client, flask_env, monkeypatch):
+        calls = []
+        def fake_token(*a, **kw):
+            calls.append(kw.get("prefer_email"))
+            return ("fake-token", {"email": "t@x", "access_token": "fake-token"})
+        monkeypatch.setattr(flask_env, "get_next_token", fake_token)
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        monkeypatch.setattr(
+            flask_env.req_lib, "post",
+            lambda *a, **kw: FakeRequestsSSE(200, _dsml_upstream_lines(["ok"])))
+        payload = {"model": "cheap", "stream": False,
+                   "messages": [{"role": "user", "content": "affinity check"}]}
+        client.post("/v1/chat/completions", json=payload)   # first turn → binds
+        assert calls[0] is None
+        client.post("/v1/chat/completions", json=payload)   # second turn → prefer
+        assert calls[1] == "t@x"
+
+    def test_chat_id_header_binds_same_conversation(self, client, flask_env, monkeypatch):
+        calls = []
+        def fake_token(*a, **kw):
+            calls.append(kw.get("prefer_email"))
+            return ("fake-token", {"email": "t@x", "access_token": "fake-token"})
+        monkeypatch.setattr(flask_env, "get_next_token", fake_token)
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        monkeypatch.setattr(
+            flask_env.req_lib, "post",
+            lambda *a, **kw: FakeRequestsSSE(200, _dsml_upstream_lines(["ok"])))
+        h = {"X-AutoClaw-Chat-Id": "conv-777"}
+        client.post("/v1/chat/completions", json={
+            "model": "cheap", "stream": False,
+            "messages": [{"role": "user", "content": "message A"}]}, headers=h)
+        client.post("/v1/chat/completions", json={
+            "model": "cheap", "stream": False,
+            "messages": [{"role": "user", "content": "message B"}]}, headers=h)
+        assert calls[0] is None
+        assert calls[1] == "t@x"
+
+
+class TestPhase2Regression:
+    def test_phase1_still_green(self):
+        """Synergy 1–5 behaviour unchanged by Phase-2 modules."""
+        from config import clamp_max_output
+        assert clamp_max_output("glm-5.2", 999999) == 131072
+        assert clamp_max_output("glm-5.2", 1024) == 1024
+        from i18n_errors import translate_error
+        assert "Insufficient credits" in translate_error("错误：积分不足")
+
+    def test_upstream_copy_gets_protocol_client_body_does_not(self, client, flask_env, monkeypatch):
+        """The upstream payload gains the DSML block; nothing leaks backwards."""
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        captured = {}
+        def fake_post(url, **kw):
+            captured.update(json=kw.get("json"))
+            return FakeRequestsSSE(200, _dsml_upstream_lines(["ok"]))
+        monkeypatch.setattr(flask_env.req_lib, "post", fake_post)
+        r = client.post("/v1/chat/completions", json={
+            "model": "cheap", "stream": False,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": TOOLS})
+        assert r.status_code == 200
+        sent = captured["json"]["messages"]
+        assert _dsml_marker() in sent[0]["content"]   # upstream copy got protocol

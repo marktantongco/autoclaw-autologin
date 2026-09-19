@@ -240,6 +240,55 @@ All upstream HTTP — chat SSE streams, token refresh, profile, wallet, ledger �
 
 > Google-OAuth **registration** calls keep their `proxies.txt` round-robin when configured — dedicated paid proxies outrank the free pool; OWL engages only when no explicit proxy is set.
 
+## 🧩 Phase 2 — DSML Tool-Calling, Chat Fingerprint, loop_breaker (v2.2.0)
+
+Three ecosystem synergies landed on top of the OWL layer (sources:
+tt-52101/chat-z-ai-proxy-web2api-free and eroslifestyle/ai-router-switch,
+per the AutoClaw Synergy Research Deep-Dive, items 8 & 9):
+
+### DSML tool-calling shim (`dsml_shim.py`)
+
+The upstream has no native OpenAI function-calling. When the client sends
+`tools`, the shim describes them in a **DSML protocol block** appended to
+the system prompt; the model's textual tool-use intent comes back as
+`<dsml:tool_call>` blocks, which the shim parses into **real OpenAI
+`tool_calls`** — buffered (`finish_reason: "tool_calls"`,
+`X-DSML-Shim: 1` header) and streaming (`DSMLStreamSieve` emits standard
+tool_calls deltas, markup never leaks to the client). `tool_choice` is
+honoured (`"none"` bypasses the shim; `"required"`/forced-function add
+mandate lines); native upstream tool calls pass through untouched.
+
+### Per-chat fingerprint isolation (`chat_fingerprint.py`)
+
+The fingerprint — SHA-256 of the **first user message**, or the
+`X-AutoClaw-Chat-Id` header — is the unit of isolation, not the bearer
+token. Each chat pins to the account that served its first request
+(account affinity); other conversations keep rotating. The pin re-binds if
+the pinned account turns unusable (repin-on-drift). Defeats
+conversation-merge attacks and keeps billing attributable per conversation.
+
+### loop_breaker (`loop_breaker.py`)
+
+Detects stuck conversations: the SAME turn (last-user-message hash)
+re-emitted **4+ times at ≥80% context fill** returns HTTP 400
+`loop_breaker_triggered`, forcing the client to start a fresh conversation
+instead of burning tokens on a context-rotted retry loop. A genuinely new
+turn resets the streak — legitimate long conversations are never killed.
+
+### Phase-2 environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTOCLAW_DSML_ENABLED` | `1` | DSML shim master switch |
+| `AUTOCLAW_FINGERPRINT_ENABLED` | `1` | Fingerprint isolation |
+| `AUTOCLAW_FINGERPRINT_TTL` | `86400` | Pin lifetime (s) |
+| `AUTOCLAW_FINGERPRINT_MAX` | `10000` | LRU capacity |
+| `AUTOCLAW_LOOP_BREAKER_ENABLED` | `1` | loop_breaker master switch |
+| `AUTOCLAW_LOOP_REEMITS` | `4` | Re-emits before trip |
+| `AUTOCLAW_LOOP_RATIO` | `0.8` | Context-fill threshold |
+| `AUTOCLAW_LOOP_TTL` | `3600` | Streak memory (s) |
+| `AUTOCLAW_CONTEXT_WINDOW` | *(per-model)* | Global context-window override |
+
 ## License
 
 
