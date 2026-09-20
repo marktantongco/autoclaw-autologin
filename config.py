@@ -10,7 +10,7 @@ if APP_KEY == "38d2391985e2369a5fb8227d8e6cd5e5":
     import warnings
     warnings.warn("AUTOCLAW_APP_KEY not set — using default (insecure, forgeable). Set env var in production.")
 PRODUCT = "autoclaw"
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 PLATFORM = "win"
 
 # ── Endpoints ──

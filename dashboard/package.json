@@ -1,7 +1,7 @@
 {
   "name": "autoclaw-dashboard",
   "private": true,
-  "version": "2.3.0",
+  "version": "2.5.0",
   "type": "module",
   "description": "AutoClaw Proxy operator dashboard (Synergy #15, source: guell11/OmniClaw-GLM-Proxy)",
   "scripts": {

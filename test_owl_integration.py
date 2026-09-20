@@ -1,4 +1,4 @@
-"""AutoClaw v2.4.0 — OWL-AGENT integration + Phase-1/2/3 synergy tests.
+"""AutoClaw v2.5.0 — OWL-AGENT integration + Phase-1/2/3 synergy tests.
 
 Run:  python -m pytest test_owl_integration.py -v
 
@@ -37,6 +37,9 @@ import thermoptic_bridge
 
 # Phase-3.1 modules (Synergy 7 + real-world metrics)
 import token_import
+
+# v2.5.0 (SPEC-8b7): dashboard auth surface
+import proxy as _proxy_mod
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -756,6 +759,10 @@ def flask_env(monkeypatch, tmp_path):
     # Phase-3.1 singletons: DSML metrics + token import counters
     dsml_shim.reset()
     token_import.reset()
+    # v2.5.0 singletons: dashboard auth tickets + fail-backoff must not leak
+    import proxy as _proxy
+    _proxy._dash_tickets.clear()
+    _proxy._dash_fails.clear()
     # auth's 5s token cache is a process-global too — a stale cache would
     # leak the real tokens.json into import tests (and vice versa)
     import auth as _auth
@@ -792,7 +799,7 @@ class TestChatRoutes:
         body = r.get_json()
         assert body["status"] == "ok"
         assert "owl" in body and body["owl"]["enabled"] is False
-        assert body["version"] == "2.4.0"
+        assert body["version"] == "2.5.0"
 
     def test_router_command_still_intercepted(self, client):
         r = client.post("/v1/chat/completions",
@@ -1806,28 +1813,43 @@ class TestDashboardRoutes:
             assert key in snap
         assert snap["health_mini"]["backend_pref"] == "owl-first"
 
-    def test_control_sets_backend_pref(self, client):
+    def test_control_sets_backend_pref(self, client, monkeypatch):
+        import proxy
+        monkeypatch.setattr(proxy, "PROXY_API_KEY", "k1")
         r = client.post("/api/dashboard/control",
+                        headers={"Authorization": "Bearer k1"},
                         json={"backend_pref": "thermoptic-first"})
         assert r.status_code == 200 and r.get_json()["ok"] is True
         assert metrics.backend_pref() == "thermoptic-first"
 
-    def test_control_rejects_invalid_pref(self, client):
-        r = client.post("/api/dashboard/control", json={"backend_pref": "yolo"})
+    def test_control_rejects_invalid_pref(self, client, monkeypatch):
+        import proxy
+        monkeypatch.setattr(proxy, "PROXY_API_KEY", "k1")
+        r = client.post("/api/dashboard/control",
+                        headers={"Authorization": "Bearer k1"},
+                        json={"backend_pref": "yolo"})
         assert r.status_code == 400
         assert metrics.backend_pref() == "owl-first"
 
     def test_control_clear_negative_cache(self, client, monkeypatch):
+        import proxy
+        monkeypatch.setattr(proxy, "PROXY_API_KEY", "k1")
         from cache import mark_permanent_failure, is_permanent_failure_cached
         mark_permanent_failure("zai_glm-5-turbo", "quota_exhausted", "t@x")
         assert is_permanent_failure_cached("zai_glm-5-turbo", "t@x")
-        r = client.post("/api/dashboard/control", json={"action": "clear_negative_cache"})
+        r = client.post("/api/dashboard/control",
+                        headers={"Authorization": "Bearer k1"},
+                        json={"action": "clear_negative_cache"})
         assert r.status_code == 200
         assert not is_permanent_failure_cached("zai_glm-5-turbo", "t@x")
 
-    def test_control_reset_metrics(self, client):
+    def test_control_reset_metrics(self, client, monkeypatch):
+        import proxy
+        monkeypatch.setattr(proxy, "PROXY_API_KEY", "k1")
         metrics.record("/v1/x", 200)
-        r = client.post("/api/dashboard/control", json={"action": "reset_metrics"})
+        r = client.post("/api/dashboard/control",
+                        headers={"Authorization": "Bearer k1"},
+                        json={"action": "reset_metrics"})
         assert r.get_json()["ok"] is True
         assert metrics.snapshot()["totals"]["requests"] == 0
 
@@ -2355,3 +2377,204 @@ class TestTokenImport:
         body = r.get_json()
         assert "token_import" in body
         assert "mode" in body["token_import"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# v2.5.0 (SPEC-8b7): Dashboard auth surface
+# ═══════════════════════════════════════════════════════════════════
+
+class TestDashboardAuth:
+    """Fail-closed posture matrix, stateless sessions, tickets, redaction."""
+
+    # ── no-key posture (fail-closed, D2) ─────────────────────────────
+
+    def test_state_open_loopback_no_key(self, client):
+        r = client.get("/api/dashboard/state")
+        assert r.status_code == 200
+        hm = r.get_json()["health_mini"]
+        assert hm["dashboard_auth_configured"] is False
+        assert hm["dashboard_public"] is False
+
+    def test_control_fails_closed_no_key(self, client):
+        # Regression pin for 8-b finding #2: control used to be OPEN when
+        # no key was configured (400 unknown-action); now 503, never open.
+        r = client.post("/api/dashboard/control", json={"action": "reset_metrics"})
+        assert r.status_code == 503
+        assert r.get_json()["error"]["type"] == "auth_unconfigured"
+
+    def test_state_rejected_remote_no_key(self, client):
+        r = client.get("/api/dashboard/state",
+                       environ_base={"REMOTE_ADDR": "10.9.9.9"})
+        assert r.status_code == 403
+        assert r.get_json()["error"]["type"] == "auth_error"
+
+    def test_public_flag_opens_remote_read_only(self, client, monkeypatch):
+        monkeypatch.setenv("ACLAW_DASHBOARD_PUBLIC", "1")
+        r = client.get("/api/dashboard/state",
+                       environ_base={"REMOTE_ADDR": "10.9.9.9"})
+        assert r.status_code == 200
+        # public flag surfaces as a warning in /health (D2)
+        h = client.get("/health").get_json()
+        assert h["dashboard_auth"]["public_read"] is True
+        assert h["dashboard_auth"]["key_configured"] is False
+        # control stays closed even in public mode
+        r2 = client.post("/api/dashboard/control", json={"action": "reset_metrics"},
+                         environ_base={"REMOTE_ADDR": "10.9.9.9"})
+        assert r2.status_code == 503
+
+    # ── key configured: session bootstrap (D1) + Bearer parity (D6) ──
+
+    def test_auth_roundtrip_and_cookie_flags(self, client, monkeypatch):
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        r = client.post("/api/dashboard/auth",
+                        headers={"Authorization": "Bearer k1"})
+        assert r.status_code == 200 and r.get_json()["ok"] is True
+        sc = r.headers["Set-Cookie"]
+        assert "aclaw_dash_session=" in sc
+        assert "HttpOnly" in sc and "SameSite=Strict" in sc
+        assert "Path=/" in sc and "Max-Age=28800" in sc
+        # cookie authenticates the read API without the key
+        r2 = client.get("/api/dashboard/state")
+        assert r2.status_code == 200
+
+    def test_state_bearer_parity(self, client, monkeypatch):
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        r = client.get("/api/dashboard/state",
+                       headers={"Authorization": "Bearer k1"})
+        assert r.status_code == 200
+
+    def test_auth_bad_key_401_and_audited(self, client, monkeypatch):
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        before = metrics.snapshot()["totals"].get("blocks", 0)
+        r = client.post("/api/dashboard/auth",
+                        headers={"Authorization": "Bearer wrong"})
+        assert r.status_code == 401
+        # D5: failed dashboard auth is audit signal in the registry
+        snap = metrics.snapshot()
+        assert snap["blocks"].get("auth_failed", 0) >= 1
+        assert snap["totals"]["blocks"] >= before
+
+    def test_auth_backoff_429_after_five_fails(self, client, monkeypatch):
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        for _ in range(5):
+            client.post("/api/dashboard/auth",
+                        headers={"Authorization": "Bearer wrong"})
+        r = client.post("/api/dashboard/auth",
+                        headers={"Authorization": "Bearer k1"})
+        assert r.status_code == 429
+        assert r.get_json()["error"]["type"] == "rate_limit"
+
+    def test_auth_delete_clears_cookie(self, client, monkeypatch):
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        client.post("/api/dashboard/auth", headers={"Authorization": "Bearer k1"})
+        r = client.delete("/api/dashboard/auth")
+        assert r.status_code == 200
+        assert "aclaw_dash_session=;" in r.headers.get("Set-Cookie", "")
+        # cookie gone → state now 401
+        r2 = client.get("/api/dashboard/state")
+        assert r2.status_code == 401
+
+    # ── session crypto (D1) ──────────────────────────────────────────
+
+    def test_expired_session_rejected(self, client, monkeypatch):
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        exp = int(time.time()) - 10
+        nonce = "a" * 32
+        val = f"{exp}.{nonce}.{_proxy_mod._dash_sign(exp, nonce)}"
+        client.set_cookie("aclaw_dash_session", val)
+        r = client.get("/api/dashboard/state")
+        assert r.status_code == 401
+
+    def test_forged_signature_rejected(self, client, monkeypatch):
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        exp = int(time.time()) + 3600
+        val = f"{exp}.{'b' * 32}.{'deadbeef' * 8}"
+        client.set_cookie("aclaw_dash_session", val)
+        r = client.get("/api/dashboard/state")
+        assert r.status_code == 401
+
+    def test_signing_key_binds_to_api_key(self, client, monkeypatch):
+        # a session minted under k1 must not verify after key rotation
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        val, _ = _proxy_mod._dash_make_session()
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k2")
+        assert not _proxy_mod._dash_verify(val)
+
+    # ── CSRF (D1a) ───────────────────────────────────────────────────
+
+    def test_origin_mismatch_rejected_on_cookie_control(self, client, monkeypatch):
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        client.post("/api/dashboard/auth", headers={"Authorization": "Bearer k1"})
+        r = client.post("/api/dashboard/control",
+                        headers={"Origin": "http://evil.example"},
+                        json={"action": "reset_metrics"})
+        assert r.status_code == 403
+        # same-origin cookie request still works (Host defaults to localhost)
+        r2 = client.post("/api/dashboard/control",
+                         headers={"Origin": "http://localhost"},
+                         json={"action": "reset_metrics"})
+        assert r2.status_code == 200
+
+    # ── WS tickets (D3) ──────────────────────────────────────────────
+
+    def test_ticket_requires_auth_when_keyed(self, client, monkeypatch):
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        r = client.get("/api/dashboard/ticket")
+        assert r.status_code == 401
+
+    def test_ticket_single_use_and_expiry(self, client, monkeypatch):
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        client.post("/api/dashboard/auth", headers={"Authorization": "Bearer k1"})
+        r = client.get("/api/dashboard/ticket")
+        assert r.status_code == 200
+        body = r.get_json()
+        assert body["expires_in"] == 60
+        t = body["ticket"]
+        assert _proxy_mod._consume_ticket(t) is True   # first consume wins
+        assert _proxy_mod._consume_ticket(t) is False  # single-use
+        # expired ticket → False even before consumption
+        _proxy_mod._dash_tickets["stale"] = time.time() - 1
+        assert _proxy_mod._consume_ticket("stale") is False
+
+    def test_ticket_minted_keyless_loopback(self, client):
+        r = client.get("/api/dashboard/ticket")
+        assert r.status_code == 200
+
+    def test_ws_handshake_auth_matrix(self, client, monkeypatch):
+        from types import SimpleNamespace
+        wah = _proxy_mod._ws_handshake_auth
+        # keyed: no credential → False
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", "k1")
+        assert wah(SimpleNamespace(environ={})) is False
+        # keyed: valid session cookie → True
+        val, _ = _proxy_mod._dash_make_session()
+        ws = SimpleNamespace(environ={"HTTP_COOKIE": f"aclaw_dash_session={val}"})
+        assert wah(ws) is True
+        # keyed: one-time ticket via query string → True then consumed
+        client2 = client
+        client2.post("/api/dashboard/auth", headers={"Authorization": "Bearer k1"})
+        t = client2.get("/api/dashboard/ticket").get_json()["ticket"]
+        ws_t = SimpleNamespace(environ={"QUERY_STRING": f"ticket={t}"})
+        assert wah(ws_t) is True
+        assert wah(SimpleNamespace(environ={"QUERY_STRING": f"ticket={t}"})) is False
+        # keyless: loopback True, remote False, remote+public True
+        monkeypatch.setattr(_proxy_mod, "PROXY_API_KEY", None)
+        assert wah(SimpleNamespace(environ={"REMOTE_ADDR": "127.0.0.1"})) is True
+        assert wah(SimpleNamespace(environ={"REMOTE_ADDR": "10.0.0.5"})) is False
+        monkeypatch.setenv("ACLAW_DASHBOARD_PUBLIC", "1")
+        assert wah(SimpleNamespace(environ={"REMOTE_ADDR": "10.0.0.5"})) is True
+
+    # ── log redaction (D5) ───────────────────────────────────────────
+
+    def test_werkzeug_log_redacts_tickets(self):
+        import logging as _logging
+        rec = _logging.LogRecord("werkzeug", _logging.INFO, __file__, 1,
+                                 "GET /api/dashboard/stream?ticket=abc123 HTTP/1.1" + " " + "-" + " %s", (200,), None)
+        _proxy_mod._TicketRedactor().filter(rec)
+        assert "ticket=[redacted]" in rec.getMessage()
+        assert "abc123" not in rec.getMessage()
+        # non-ticket lines untouched
+        rec2 = _logging.LogRecord("werkzeug", _logging.INFO, __file__, 1,
+                                  "GET /health HTTP/1.1 200", (), None)
+        assert _proxy_mod._TicketRedactor().filter(rec2) is True
+        assert rec2.getMessage() == "GET /health HTTP/1.1 200"

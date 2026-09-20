@@ -17,6 +17,12 @@ import time
 import uuid
 import threading
 import logging
+import hmac
+import hashlib
+import secrets
+import re
+import urllib.parse
+from collections import deque
 from flask import Flask, request, Response, jsonify, g, redirect
 import requests as req_lib
 import urllib3
@@ -71,6 +77,24 @@ import token_import  # Synergy 7 (Phase-3.1): no-CloakBrowser import mode
 
 # ─── Structured Logging ──────────────────────────────────────────────
 logger = logging.getLogger("autoclaw.proxy")
+
+
+class _TicketRedactor(logging.Filter):
+    """v2.5.0 (SPEC-8b7 D5): keep one-time WS tickets out of access logs.
+    Werkzeug logs URLs with query strings; ?ticket=... must never persist."""
+
+    def filter(self, record):
+        try:
+            msg = record.getMessage()
+            if "ticket=" in msg:
+                record.msg = re.sub(r"ticket=[^ \"']+", "ticket=[redacted]", msg)
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
+
+logging.getLogger("werkzeug").addFilter(_TicketRedactor())
 
 TOKENS_FILE_FULL = TOKENS_FILE  # full path for backup operations
 
@@ -984,6 +1008,12 @@ def health():
         "accounts": len(data["accounts"]),
         "port": PROXY_PORT,
         "version": VERSION,
+        # v2.5.0 (SPEC-8b7 D2): dashboard auth posture — public_read is a
+        # WARNING flag; operators running ACLAW_DASHBOARD_PUBLIC=1 must see it.
+        "dashboard_auth": {
+            "key_configured": bool(PROXY_API_KEY),
+            "public_read": _dash_public(),
+        },
         # Synergy 6: OWL-AGENT proxy defense layer stats (never raises)
         "owl": owl_bridge.owl_stats(),
         # Synergy 9 (Phase 2): per-chat fingerprint + loop_breaker (ai-router-switch)
@@ -1550,6 +1580,9 @@ def _dashboard_health_mini():
     try:
         return {
             "version": VERSION,
+            # v2.5.0 (SPEC-8b7): auth posture for the UI login card + banner
+            "dashboard_auth_configured": bool(PROXY_API_KEY),
+            "dashboard_public": _dash_public(),
             "accounts": len(load_tokens()["accounts"]),
             "owl_enabled": owl_bridge.owl_enabled(),
             "thermoptic_healthy": thermoptic_bridge.healthy(),
@@ -1563,7 +1596,14 @@ def _dashboard_health_mini():
 
 @app.route("/api/dashboard/state", methods=["GET"])
 def dashboard_state():
-    """Full metrics snapshot (REST fallback for the WebSocket stream)."""
+    """Full metrics snapshot (REST fallback for the WebSocket stream).
+
+    v2.5.0 (SPEC-8b7 D2): read surface — Bearer/session when a key is
+    configured; loopback-only (or ACLAW_DASHBOARD_PUBLIC=1) otherwise.
+    """
+    guard = _dash_guard(mutating=False)
+    if guard is not None:
+        return guard
     snap = metrics.snapshot()
     snap["health_mini"] = _dashboard_health_mini()
     snap["dsml"] = dsml_shim.stats()  # Phase-3.1: DSML real-world panel
@@ -1578,14 +1618,13 @@ def dashboard_control():
       {"backend_pref": "owl-first"|"thermoptic-first"|"direct-only"}
       {"action": "clear_negative_cache"}   — wipe permanent-failure cache
       {"action": "reset_metrics"}          — zero the dashboard counters
-    Protected by PROXY_API_KEY when one is configured (routing control is
-    privileged, unlike read-only state).
+    v2.5.0 (SPEC-8b7 D2): fail-closed — with a key configured, Bearer or
+    session cookie (Origin-checked); WITHOUT a key this endpoint is 503
+    auth_unconfigured (never open — fixes 8-b finding #2).
     """
-    if PROXY_API_KEY:
-        auth = request.headers.get("Authorization", "")
-        if auth != f"Bearer {PROXY_API_KEY}":
-            return jsonify({"error": {"message": "Invalid API key",
-                                      "type": "auth_error"}}), 401
+    guard = _dash_guard(mutating=True)
+    if guard is not None:
+        return guard
     body = request.get_json(force=True, silent=True) or {}
     if "backend_pref" in body:
         ok, msg = metrics.set_backend_pref(body.get("backend_pref"))
@@ -1599,6 +1638,249 @@ def dashboard_control():
         return jsonify({"ok": True, "message": "metrics reset"})
     return jsonify({"ok": False,
                     "message": "unknown control action"}), 400
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v2.5.0 (SPEC-8b7): Dashboard auth surface.
+#
+# Posture matrix (D2, fail-closed):
+#   PROXY_API_KEY set  → Bearer (D6 parity) or stateless session cookie (D1);
+#                        cookie-authenticated MUTATING requests are Origin-
+#                        checked (D1a). 5 fails/60s/source → 429 (D5).
+#   no key configured  → control = 503 auth_unconfigured (NEVER open — fixes
+#                        8-b finding #2); reads loopback-only, or public when
+#                        ACLAW_DASHBOARD_PUBLIC=1 (surfaced as a /health and
+#                        health_mini warning flag).
+# WS: one-time 60s tickets (D3) because browsers cannot set WS headers.
+# Sessions are HMAC-signed (key derived from PROXY_API_KEY) → stateless,
+# multi-worker-safe (no shared session store needed — backlog item 17
+# stays orthogonal).
+# ─────────────────────────────────────────────────────────────────────
+
+_DASH_COOKIE = "aclaw_dash_session"
+_DASH_SESSION_TTL = int(os.environ.get("ACLAW_DASH_SESSION_TTL", "28800"))
+_DASH_TICKET_TTL = 60
+_dash_tickets = {}                    # ticket -> expiry epoch (single-use)
+_dash_tickets_lock = threading.Lock()
+_dash_fails = {}                      # peer ip -> deque[fail epochs]
+_dash_fails_lock = threading.Lock()
+
+
+def _dash_public():
+    """ACLAW_DASHBOARD_PUBLIC=1 — public READ escape hatch (default 0)."""
+    return os.environ.get("ACLAW_DASHBOARD_PUBLIC", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _dash_signing_key():
+    """HMAC key derived from PROXY_API_KEY (stable across workers)."""
+    return hmac.new(("aclaw-dash-v1:" + (PROXY_API_KEY or "")).encode(),
+                    b"dash-session", hashlib.sha256).digest()
+
+
+def _dash_sign(exp, nonce):
+    return hmac.new(_dash_signing_key(), f"{exp}.{nonce}".encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _dash_make_session():
+    exp = int(time.time()) + _DASH_SESSION_TTL
+    nonce = secrets.token_hex(16)
+    return f"{exp}.{nonce}.{_dash_sign(exp, nonce)}", exp
+
+
+def _dash_verify(value):
+    """Constant-time session verification (D1). Never raises."""
+    try:
+        exp_s, nonce, sig = value.split(".")
+        exp = int(exp_s)
+    except (ValueError, AttributeError):
+        return False
+    if exp < time.time():
+        return False
+    return hmac.compare_digest(_dash_sign(exp, nonce), sig)
+
+
+def _dash_cred():
+    """Resolve the request credential: 'bearer' | 'cookie' | None (D1/D6)."""
+    if not PROXY_API_KEY:
+        return None
+    if request.headers.get("Authorization", "") == f"Bearer {PROXY_API_KEY}":
+        return "bearer"
+    if _dash_verify(request.cookies.get(_DASH_COOKIE, "")):
+        return "cookie"
+    return None
+
+
+def _is_loopback():
+    addr = request.remote_addr or ""
+    return addr in ("127.0.0.1", "::1", "localhost") or addr.startswith("127.")
+
+
+def _origin_mismatch():
+    """D1a: cross-origin when Origin is present and host differs (CSRF)."""
+    origin = request.headers.get("Origin")
+    if not origin:
+        return False
+    try:
+        return (urllib.parse.urlsplit(origin).netloc or "") != (
+            request.headers.get("Host", ""))
+    except Exception:
+        return True
+
+
+def _dash_backoff_reject():
+    """D5: ≥5 failed auth attempts within 60s from one source → reject."""
+    ip = request.remote_addr or "unknown"
+    now = time.time()
+    with _dash_fails_lock:
+        dq = _dash_fails.setdefault(ip, deque())
+        while dq and now - dq[0] > 60:
+            dq.popleft()
+        return len(dq) >= 5
+
+
+def _dash_record_fail():
+    ip = request.remote_addr or "unknown"
+    with _dash_fails_lock:
+        _dash_fails.setdefault(ip, deque()).append(time.time())
+
+
+def _audit_auth_fail(status):
+    """D5: failed dashboard auth is audit SIGNAL (not noise) — record it into
+    the registry even though /api/dashboard/* is otherwise metrics-skipped."""
+    try:
+        metrics.record(route=request.path, status=status, via="local",
+                       client_ip=request.remote_addr, block="auth_failed")
+    except Exception:
+        pass
+
+
+def _consume_ticket(ticket):
+    """D3: single-use, 60s-expiry ticket consumption. Never raises."""
+    if not ticket:
+        return False
+    now = time.time()
+    with _dash_tickets_lock:
+        exp = _dash_tickets.pop(ticket, None)
+        return bool(exp) and exp >= now
+
+
+def _ws_handshake_auth(ws):
+    """D3: WS handshake auth — environ-only (no request-context coupling)."""
+    environ = getattr(ws, "environ", {}) or {}
+    if PROXY_API_KEY:
+        raw = ""
+        try:
+            from http.cookies import SimpleCookie
+            cookie = SimpleCookie(environ.get("HTTP_COOKIE", ""))
+            raw = cookie[_DASH_COOKIE].value if _DASH_COOKIE in cookie else ""
+        except Exception:
+            raw = ""
+        if raw and _dash_verify(raw):
+            return True
+        q = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
+        return _consume_ticket((q.get("ticket") or [""])[0])
+    addr = environ.get("REMOTE_ADDR") or ""
+    loopback = addr in ("127.0.0.1", "::1") or addr.startswith("127.")
+    return loopback or _dash_public()
+
+
+def _dash_guard(mutating=False):
+    """SPEC-8b7 D2 fail-closed guard. Returns an error (resp, status) tuple
+    or None to allow. See the posture matrix in the section docstring."""
+    if PROXY_API_KEY:
+        if _dash_backoff_reject():
+            return (jsonify({"error": {
+                "message": "too many failed attempts; wait 60s",
+                "type": "rate_limit"}}), 429)
+        cred = _dash_cred()
+        if cred == "bearer":
+            return None
+        if cred == "cookie":
+            if mutating and _origin_mismatch():
+                _audit_auth_fail(403)
+                return (jsonify({"error": {
+                    "message": "cross-origin request rejected",
+                    "type": "auth_error"}}), 403)
+            return None
+        _dash_record_fail()
+        _audit_auth_fail(401)
+        return (jsonify({"error": {"message": "Invalid API key",
+                                   "type": "auth_error"}}), 401)
+    # No key configured — fail closed.
+    if mutating:
+        return (jsonify({"error": {
+            "message": "control requires AUTOCLAW_PROXY_API_KEY to be configured",
+            "type": "auth_unconfigured"}}), 503)
+    if _dash_public() or _is_loopback():
+        return None
+    _audit_auth_fail(403)
+    return (jsonify({"error": {
+        "message": "dashboard reads are loopback-only; configure "
+                   "AUTOCLAW_PROXY_API_KEY to authenticate remotely",
+        "type": "auth_error"}}), 403)
+
+
+@app.route("/api/dashboard/auth", methods=["POST", "DELETE"])
+def dashboard_auth():
+    """D1 bootstrap exchange: Bearer key → HttpOnly session cookie (POST);
+    DELETE clears it. Key never touches localStorage (D4)."""
+    if request.method == "DELETE":
+        resp = jsonify({"ok": True, "message": "signed out"})
+        resp.delete_cookie(_DASH_COOKIE, path="/")
+        return resp
+    if _dash_backoff_reject():
+        return jsonify({"error": {"message": "too many failed attempts; wait 60s",
+                                  "type": "rate_limit"}}), 429
+    if not PROXY_API_KEY:
+        return jsonify({"error": {
+            "message": "no AUTOCLAW_PROXY_API_KEY configured; dashboard reads "
+                       "are loopback-open, control stays disabled",
+            "type": "auth_unconfigured"}}), 503
+    if request.headers.get("Authorization", "") != f"Bearer {PROXY_API_KEY}":
+        _dash_record_fail()
+        _audit_auth_fail(401)
+        return jsonify({"error": {"message": "Invalid API key",
+                                  "type": "auth_error"}}), 401
+    if _origin_mismatch():
+        _audit_auth_fail(403)
+        return jsonify({"error": {"message": "cross-origin auth rejected",
+                                  "type": "auth_error"}}), 403
+    value, _exp = _dash_make_session()
+    resp = jsonify({"ok": True, "expires_in": _DASH_SESSION_TTL})
+    # NOTE: no Secure flag — the dashboard is served over plain HTTP on
+    # loopback/LAN by design; Secure would break every http deployment.
+    # SameSite=Strict + Origin checks (D1a) carry the CSRF defense.
+    resp.set_cookie(_DASH_COOKIE, value, max_age=_DASH_SESSION_TTL,
+                    httponly=True, samesite="Strict", path="/")
+    return resp
+
+
+@app.route("/api/dashboard/ticket", methods=["GET"])
+def dashboard_ticket():
+    """D3: mint a single-use 60s WS ticket (cookie/bearer-authenticated;
+    loopback/public when no key). Tickets are never logged (D5 redactor)."""
+    if PROXY_API_KEY:
+        if _dash_cred() is None:
+            if _dash_backoff_reject():
+                return jsonify({"error": {"message": "too many failed attempts",
+                                          "type": "rate_limit"}}), 429
+            _dash_record_fail()
+            _audit_auth_fail(401)
+            return jsonify({"error": {"message": "authentication required",
+                                      "type": "auth_error"}}), 401
+    elif not (_dash_public() or _is_loopback()):
+        _audit_auth_fail(403)
+        return jsonify({"error": {"message": "forbidden",
+                                  "type": "auth_error"}}), 403
+    ticket = secrets.token_urlsafe(24)
+    now = time.time()
+    with _dash_tickets_lock:
+        for t in [t for t, e in _dash_tickets.items() if e < now]:
+            _dash_tickets.pop(t, None)   # opportunistic GC
+        _dash_tickets[ticket] = now + _DASH_TICKET_TTL
+    return jsonify({"ticket": ticket, "expires_in": _DASH_TICKET_TTL})
 
 
 # Long-running WebSocket metrics endpoint (flask-sock is an optional dep —
@@ -1623,8 +1905,21 @@ if _sock is not None:
     @_sock.route("/api/dashboard/stream")
     def dashboard_stream(ws):
         """Push a metrics snapshot every second; sender-closed detection
-        relies on send() raising when the peer disconnects."""
+        relies on send() raising when the peer disconnects.
+
+        v2.5.0 (SPEC-8b7 D3): handshake authenticated BEFORE the cap/first
+        frame — unauthenticated peers get an error frame + close(4001).
+        """
         import simple_websocket
+        if not _ws_handshake_auth(ws):
+            try:
+                ws.send(json.dumps({"error": {
+                    "message": "authentication required",
+                    "type": "auth_error"}}))
+                ws.close(4001)
+            except Exception:
+                pass
+            return
         with _ws_clients_lock:
             _ws_clients["n"] += 1
             over_cap = _ws_clients["n"] > _WS_CLIENT_CAP

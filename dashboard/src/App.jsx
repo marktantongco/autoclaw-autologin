@@ -6,6 +6,7 @@ import RequestLog from "./components/RequestLog.jsx";
 import ClientList from "./components/ClientList.jsx";
 import ControlPanel from "./components/ControlPanel.jsx";
 import DSMLPanel from "./components/DSMLPanel.jsx";
+import LoginCard from "./components/LoginCard.jsx";
 
 /** Compact counter formatting: 1.2k / 3.4M (Phase-3.1, 8-b W16). */
 const compact = (n) =>
@@ -31,22 +32,42 @@ const fmtUptime = (s) => {
  * Phase-3.1 (research 8-b): exponential WS reconnect backoff with reset on
  * success + periodic WS retry while polling; DSML real-world panel; hourly
  * history strip from persisted rollups.
+ *
+ * v2.5.0 (SPEC-8b7): auth state machine — 401 on the state API flips to a
+ * login card (key exchanged once for an HttpOnly session cookie, D4);
+ * 503 auth_unconfigured disables the control surface with an explanatory
+ * banner (D2 fail-closed); WS connects consume a one-time ticket (D3);
+ * all fetches send credentials:same-origin; sign-out clears the session.
  */
 export default function App() {
   const [data, setData] = useState(null);
   const [conn, setConn] = useState("connecting"); // live | polling | connecting
+  const [auth, setAuth] = useState("boot");       // boot | open | locked
+  const [controlBlocked, setControlBlocked] = useState(false);
   const wsRef = useRef(null);
   const pollRef = useRef(null);
   const retryRef = useRef(null);   // pending WS retry timer while polling
   const attemptsRef = useRef(0);
   const MAX_WS_ATTEMPTS = 5;
 
+  const stopStreams = useCallback(() => {
+    if (wsRef.current) { try { wsRef.current.close(); } catch (e) { /* noop */ } wsRef.current = null; }
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+    if (retryRef.current) { clearTimeout(retryRef.current); retryRef.current = null; }
+  }, []);
+
   const startPolling = useCallback(() => {
     if (pollRef.current) return;
     setConn("polling");
     const tick = async () => {
       try {
-        const r = await fetch("/api/dashboard/state", { cache: "no-store" });
+        const r = await fetch("/api/dashboard/state",
+          { cache: "no-store", credentials: "same-origin" });
+        if (r.status === 401) {           // session expired mid-poll (SPEC-8b7 D4)
+          stopStreams();
+          setAuth("locked");
+          return;
+        }
         if (r.ok) setData(await r.json());
       } catch (e) { /* keep last snapshot */ }
     };
@@ -59,16 +80,28 @@ export default function App() {
       retryRef.current = setTimeout(retry, 30000);
     };
     retryRef.current = setTimeout(retry, 30000);
-  }, []);
+  }, [stopStreams]);
 
-  const connectWS = useCallback((resetAttempts = false) => {
+  const connectWS = useCallback(async (resetAttempts = false) => {
     if (resetAttempts) attemptsRef.current = 0;
     if (attemptsRef.current >= MAX_WS_ATTEMPTS) { startPolling(); return; }
     attemptsRef.current += 1;
     const proto = location.protocol === "https:" ? "wss://" : "ws://";
+    // SPEC-8b7 D3: browsers can't set WS headers — mint a one-time 60s
+    // ticket and append it to the handshake URL. Older servers without the
+    // ticket endpoint (or keyless-loopback mode) just get the plain URL.
+    let url = `${proto}${location.host}/api/dashboard/stream`;
+    try {
+      const tr = await fetch("/api/dashboard/ticket",
+        { cache: "no-store", credentials: "same-origin" });
+      if (tr.ok) {
+        const tj = await tr.json();
+        if (tj && tj.ticket) url += `?ticket=${encodeURIComponent(tj.ticket)}`;
+      }
+    } catch (e) { /* plain connect — server may predate tickets */ }
     let ws;
     try {
-      ws = new WebSocket(`${proto}${location.host}/api/dashboard/stream`);
+      ws = new WebSocket(url);
     } catch (e) { startPolling(); return; }
     wsRef.current = ws;
     ws.onopen = () => {
@@ -82,40 +115,93 @@ export default function App() {
         const msg = JSON.parse(ev.data);
         if (msg && msg.hello) return; // handshake frame
         if (msg && msg.error === "too_many_clients") { startPolling(); return; }
+        if (msg && msg.error && msg.error.type === "auth_error") { // pre-auth frame
+          stopStreams(); setAuth("locked"); return;
+        }
         setData(msg);
       } catch (e) { /* ignore malformed frame */ }
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       wsRef.current = null;
+      // SPEC-8b7: 4001 = authenticated close — flip to the login card and
+      // stop the reconnect ladder entirely.
+      if (ev && ev.code === 4001) { stopStreams(); setAuth("locked"); return; }
       // exponential backoff: 1s → 2s → 4s → 8s → capped 15s
       const wait = Math.min(15000, 1000 * Math.pow(2, attemptsRef.current - 1));
       setTimeout(attemptsRef.current >= MAX_WS_ATTEMPTS ? startPolling : connectWS, wait);
     };
     ws.onerror = () => { try { ws.close(); } catch (e) { /* noop */ } };
-  }, [startPolling]);
+  }, [startPolling, stopStreams]);
+
+  /** Boot / re-entry after login: probe the read API to classify posture. */
+  const bootstrap = useCallback(async () => {
+    setConn("connecting");
+    try {
+      const r = await fetch("/api/dashboard/state",
+        { cache: "no-store", credentials: "same-origin" });
+      if (r.status === 401) { stopStreams(); setAuth("locked"); return; }
+      if (r.ok) {
+        setData(await r.json());
+        setAuth("open");
+        connectWS(true);
+        return;
+      }
+      // unexpected status — fall back to polling (legacy server safety net)
+      setData({});
+      setAuth("open");
+      startPolling();
+    } catch (e) {
+      setData({});
+      setAuth("open");
+      startPolling();
+    }
+  }, [connectWS, startPolling, stopStreams]);
 
   useEffect(() => {
-    connectWS();
-    return () => {
-      if (wsRef.current) { try { wsRef.current.close(); } catch (e) { /* noop */ } }
-      if (pollRef.current) clearInterval(pollRef.current);
-      if (retryRef.current) clearTimeout(retryRef.current);
-    };
+    bootstrap();
+    return stopStreams;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const refreshState = useCallback(async () => {
+    try {
+      const r = await fetch("/api/dashboard/state",
+        { cache: "no-store", credentials: "same-origin" });
+      if (r.status === 401) { stopStreams(); setAuth("locked"); return false; }
+      if (r.ok) setData(await r.json());
+      return r.ok;
+    } catch (e) { return false; }
+  }, [stopStreams]);
+
   const post = useCallback(async (body) => {
     try {
-      await fetch("/api/dashboard/control", {
+      const r = await fetch("/api/dashboard/control", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
         body: JSON.stringify(body),
       });
-      // optimistic refresh
-      const r = await fetch("/api/dashboard/state", { cache: "no-store" });
-      if (r.ok) setData(await r.json());
+      // SPEC-8b7 D2/D4: surface fail-closed instead of silently swallowing.
+      if (r.status === 401) { stopStreams(); setAuth("locked"); return; }
+      setControlBlocked(r.status === 503);
+      await refreshState();
     } catch (e) { /* surfaced via metrics on next tick */ }
-  }, []);
+  }, [refreshState, stopStreams]);
+
+  const signOut = useCallback(async () => {
+    try {
+      await fetch("/api/dashboard/auth",
+        { method: "DELETE", credentials: "same-origin" });
+    } catch (e) { /* clearing client state regardless */ }
+    stopStreams();
+    setData(null);
+    setControlBlocked(false);
+    setAuth("locked");
+  }, [stopStreams]);
+
+  if (auth === "locked") {
+    return <LoginCard onSuccess={bootstrap} />;
+  }
 
   if (!data) {
     return <div className="boot">◌ Connecting to AutoClaw proxy…</div>;
@@ -131,6 +217,7 @@ export default function App() {
       const d = new Date(b.hour * 3600 * 1000);
       return [`${String(d.getHours()).padStart(2, "0")}:00`, b.requests];
     });
+  const publicMode = !!hm.dashboard_public && !hm.dashboard_auth_configured;
 
   return (
     <div className="shell">
@@ -153,8 +240,27 @@ export default function App() {
           <span className="badge" title="proxy uptime · telemetry persisted across restarts">
             up {fmtUptime(data.uptime_s)}
           </span>
+          {hm.dashboard_auth_configured && (
+            <button className="badge badge-btn" onClick={signOut}
+              title="clear the dashboard session cookie">sign out</button>
+          )}
         </div>
       </header>
+
+      {publicMode && (
+        <div className="banner warn" role="alert">
+          ⚠ Public read mode (<code>ACLAW_DASHBOARD_PUBLIC=1</code>) — telemetry is
+          served unauthenticated. Set <code>AUTOCLAW_PROXY_API_KEY</code> and remove
+          the override to lock this surface.
+        </div>
+      )}
+      {controlBlocked && (
+        <div className="banner info" role="status">
+          Control surface disabled — this proxy runs without an API key
+          (fail-closed). Set <code>AUTOCLAW_PROXY_API_KEY</code> and sign in to
+          enable backend switching.
+        </div>
+      )}
 
       <section className="cards">
         <StatCard label="Requests" value={compact(t.requests)} hint={`${t.stream ?? 0} stream · ${t.buffered ?? 0} buffered`} />
@@ -228,7 +334,8 @@ export default function App() {
         </section>
       )}
 
-      <ControlPanel control={data.control || {}} onSetPref={(p) => post({ backend_pref: p })}
+      <ControlPanel control={data.control || {}} disabled={controlBlocked}
+        onSetPref={(p) => post({ backend_pref: p })}
         onAction={(a) => post({ action: a })} />
 
       <section className="grid-2">
@@ -237,7 +344,7 @@ export default function App() {
       </section>
 
       <footer className="foot">
-        AutoClaw v{hm.version || "?"} · Synergies 1–6, 8–15 · #7 import mode ·{" "}
+        AutoClaw v{hm.version || "?"} · Synergies 1–6, 7–15 · dashboard auth (SPEC-8b7) ·{" "}
         <a href="/" target="_blank" rel="noreferrer">classic UI</a> ·{" "}
         <a href="/health" target="_blank" rel="noreferrer">/health</a>
       </footer>

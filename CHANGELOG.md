@@ -1,5 +1,59 @@
 # Changelog
 
+## v2.5.0 — Dashboard Auth Surface (SPEC-8b7) (2026-09-20)
+
+**Scope:** the top remaining 8-b backlog item — the dashboard/telemetry
+authentication surface, implemented per the research-graded SPEC-8b7
+(`release-assets/spec-8b7-dashboard-auth-v250.md`). Also carries the deploy
+hardening commit `4d7de65` (production `ACLAW_OAUTH_MODE=import`).
+
+### Added
+
+- **Fail-closed posture matrix (D2)** — with `AUTOCLAW_PROXY_API_KEY`
+  configured, `/api/dashboard/state`, `/api/dashboard/control` and the WS
+  stream require Bearer parity or a session cookie; WITHOUT a key, control
+  answers **503 `auth_unconfigured` (never open again)** and reads are
+  loopback-only — fixing 8-b finding #2 (control used to be open when no
+  key was set) and #1/#3 (unauthenticated state/WS read APIs).
+- **Stateless session bootstrap (D1)** — `POST /api/dashboard/auth`
+  exchanges `Bearer $AUTOCLAW_PROXY_API_KEY` once for an
+  `HttpOnly; SameSite=Strict; Path=/` cookie (`aclaw_dash_session`,
+  8h TTL). Value = `exp.nonce.HMAC-SHA256(key)` with the signing key
+  derived from the API key — **stateless, multi-worker-safe** (no shared
+  session store; constant-time verification; key rotation invalidates all
+  sessions). `DELETE /api/dashboard/auth` signs out.
+- **CSRF defense-in-depth (D1a)** — cookie-authenticated mutating requests
+  are Origin/Host-checked; cross-origin POSTs rejected 403.
+- **WS one-time tickets (D3)** — `GET /api/dashboard/ticket` mints a
+  single-use 60s ticket consumed via `?ticket=` on the WS handshake
+  (browsers cannot set WS headers); unauthenticated handshakes get an
+  error frame + close code **4001**.
+- **Brute-force backoff + audit (D5)** — ≥5 failed auth attempts / 60s /
+  source → 429; failed dashboard auth is recorded into the metrics
+  registry as `blocks.auth_failed` (audit signal, not noise).
+- **Log redaction (D5)** — werkzeug access-log filter rewrites
+  `ticket=…` to `ticket=[redacted]`; one-time tickets never persist.
+- **UI login card + auth state machine (D4)** — 401 flips the React
+  dashboard to a login card (key typed once, never stored — no
+  localStorage); all fetches send `credentials: same-origin`; 401s are
+  handled (never swallowed again — fixes 8-b finding #4); sign-out
+  button; fail-closed banner explains the disabled control surface when
+  the proxy runs keyless.
+- **`ACLAW_DASHBOARD_PUBLIC=1` escape hatch (D2)** — public
+  *unauthenticated READS* for exotic setups; surfaced as a warning flag in
+  `/health` (`dashboard_auth.public_read`) and a UI banner; control stays
+  503 regardless.
+- `/health` gains the `dashboard_auth` posture block; `health_mini` gains
+  `dashboard_auth_configured` / `dashboard_public` for the UI.
+
+### Changed
+
+- Dashboard bundle rebuilt (vite, 51 KB gz) with the auth state machine.
+- 4 existing keyless control tests re-anchored to the authenticated
+  posture; **17 new auth tests** (posture matrix, session crypto incl.
+  expiry/forge/key-rotation binding, CSRF, ticket single-use/expiry, WS
+  handshake matrix, redaction, backoff) — suite now **198/198**.
+
 ## v2.4.0 — Phase 3.1: Synergy #7 Import Mode + DSML Real-World Metrics + Dashboard Tuning (2026-09-20)
 
 **Scope:** the deferred Synergy #7 (no-CloakBrowser mode, promoted after a

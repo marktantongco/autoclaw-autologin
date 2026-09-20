@@ -6,18 +6,20 @@ const PREFS = [
   { id: "direct-only", label: "direct-only", desc: "no proxy layers (debug)" },
 ];
 
-/** Backend-switch control surface (OmniClaw dashboard contract). */
-export default function ControlPanel({ control, onSetPref, onAction }) {
+/** Backend-switch control surface (OmniClaw dashboard contract).
+ * v2.5.0 (SPEC-8b7 D2/D4): `disabled` when the proxy runs keyless — the
+ * control API answers 503 auth_unconfigured in that posture. */
+export default function ControlPanel({ control, onSetPref, onAction, disabled = false }) {
   const [busy, setBusy] = useState(false);
   const apply = async (fn) => { setBusy(true); try { await fn(); } finally { setBusy(false); } };
   return (
-    <section className="panel control">
-      <h2>Control surface</h2>
+    <section className={`panel control ${disabled ? "control-disabled" : ""}`}>
+      <h2>Control surface {disabled && <span className="mut">· disabled (no API key configured)</span>}</h2>
       <div className="pref-row">
         {PREFS.map((p) => (
           <button key={p.id}
             className={`pref ${control.backend_pref === p.id ? "active" : ""} ${busy ? "busy" : ""}`}
-            disabled={busy || control.backend_pref === p.id}
+            disabled={disabled || busy || control.backend_pref === p.id}
             onClick={() => apply(() => onSetPref(p.id))}>
             <span className="pref-label">{p.label}</span>
             <span className="pref-desc">{p.desc}</span>
@@ -25,10 +27,10 @@ export default function ControlPanel({ control, onSetPref, onAction }) {
         ))}
       </div>
       <div className="action-row">
-        <button className="action" disabled={busy} onClick={() => apply(() => onAction("clear_negative_cache"))}>
+        <button className="action" disabled={disabled || busy} onClick={() => apply(() => onAction("clear_negative_cache"))}>
           Clear negative cache
         </button>
-        <button className="action danger" disabled={busy} onClick={() => apply(() => onAction("reset_metrics"))}>
+        <button className="action danger" disabled={disabled || busy} onClick={() => apply(() => onAction("reset_metrics"))}>
           Reset metrics
         </button>
         <span className="hint">

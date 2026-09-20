@@ -326,6 +326,34 @@ stream dead peers held threads (keepalive + client cap now); slash-less
 
 **Tests: 149 → 180.**
 
+## 🔐 Phase 3.2 — Dashboard Auth Surface (v2.5.0)
+
+The operator dashboard and telemetry APIs are now **fail-closed** (SPEC-8b7).
+Posture depends on whether `AUTOCLAW_PROXY_API_KEY` is configured:
+
+| Posture | state/WS reads | control |
+|---------|----------------|---------|
+| key set | Bearer **or** session cookie | Bearer / session (Origin-checked) |
+| no key, loopback peer | allowed | **503 `auth_unconfigured`** (never open) |
+| no key, remote peer | 403 | 503 |
+| `ACLAW_DASHBOARD_PUBLIC=1` | public (warned in `/health` + UI banner) | 503 |
+
+- **Login:** open the dashboard with a key configured → login card → the key
+  is exchanged ONCE (`POST /api/dashboard/auth`) for an HttpOnly
+  `SameSite=Strict` cookie (8h). The key is never stored by the UI.
+- **WebSocket:** browsers cannot set WS headers, so the UI mints a one-time
+  60s ticket (`GET /api/dashboard/ticket`) and appends it to the handshake;
+  unauthenticated handshakes are closed with code 4001. Tickets are
+  redacted from access logs.
+- **Hardening:** ≥5 failed auths / 60s / source → 429; failed dashboard
+  auth lands in the metrics registry as `blocks.auth_failed` (visible on
+  the Blocks panel); sessions are HMAC-signed with a key derived from
+  `AUTOCLAW_PROXY_API_KEY` — stateless, multi-worker-safe, and rotation
+  invalidates every session instantly.
+- **Knobs:** `ACLAW_DASH_SESSION_TTL` (default 28800s),
+  `ACLAW_DASHBOARD_PUBLIC` (default 0 — leave off unless you understand the
+  exposure), `ACLAW_DASH_WS_CAP` (client cap, default 20).
+
 ## 🧩 Phase 3 — WS Fallback, thermoptic Egress, React Dashboard (v2.3.0)
 
 Completes the Priority-3 tier of the AutoClaw Ecosystem Synergy Research
