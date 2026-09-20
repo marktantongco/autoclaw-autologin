@@ -21,6 +21,9 @@ EnvironmentFile=-/etc/autoclaw/env
 Environment=PYTHONUNBUFFERED=1
 Environment=AUTOCLAW_PROXY_HOST=127.0.0.1
 Environment=AUTOCLAW_PROXY_PORT=31000
+# Browser OAuth harvest is upstream-deprecated (405, live-probed 2026-09-19).
+# Hard-fail browser flows at unit level; token import API is unaffected.
+Environment=ACLAW_OAUTH_MODE=import
 
 # Resource Limits
 MemoryMax=512M

@@ -13,3 +13,4 @@ proxies.txt
 .pytest_cache/
 node_modules/
 data/metrics_state.json
+proxy.pid
