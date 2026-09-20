@@ -1,4 +1,4 @@
-"""AutoClaw v2.3.0 — OWL-AGENT integration + Phase-1/2/3 synergy tests.
+"""AutoClaw v2.4.0 — OWL-AGENT integration + Phase-1/2/3 synergy tests.
 
 Run:  python -m pytest test_owl_integration.py -v
 
@@ -34,6 +34,9 @@ import dsml_shim
 import metrics
 import ws_fallback
 import thermoptic_bridge
+
+# Phase-3.1 modules (Synergy 7 + real-world metrics)
+import token_import
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -750,6 +753,14 @@ def flask_env(monkeypatch, tmp_path):
     metrics.set_backend_pref("owl-first")
     ws_fallback._reset_for_tests()
     thermoptic_bridge._reset_for_tests()
+    # Phase-3.1 singletons: DSML metrics + token import counters
+    dsml_shim.reset()
+    token_import.reset()
+    # auth's 5s token cache is a process-global too — a stale cache would
+    # leak the real tokens.json into import tests (and vice versa)
+    import auth as _auth
+    _auth._token_cache = None
+    _auth._token_cache_ts = 0.0
     monkeypatch.setattr(proxy, "get_next_token",
                         lambda *a, **kw: ("fake-token", {"email": "t@x", "access_token": "fake-token"}))
     monkeypatch.setattr(proxy, "load_tokens", lambda: {"accounts": []})
@@ -781,7 +792,7 @@ class TestChatRoutes:
         body = r.get_json()
         assert body["status"] == "ok"
         assert "owl" in body and body["owl"]["enabled"] is False
-        assert body["version"] == "2.3.0"
+        assert body["version"] == "2.4.0"
 
     def test_router_command_still_intercepted(self, client):
         r = client.post("/v1/chat/completions",
@@ -1830,9 +1841,23 @@ class TestDashboardRoutes:
         assert r.status_code == 200
 
     def test_dashboard_page_served(self, client):
-        r = client.get("/dashboard")
+        # /dashboard 308-redirects to /dashboard/ (relative-asset fix);
+        # following the redirect must yield the shell.
+        r = client.get("/dashboard", follow_redirects=True)
         assert r.status_code == 200
         assert b"<div id=\"root\">" in r.data
+
+    def test_dashboard_noslash_redirects_for_relative_assets(self, client):
+        # Regression: slash-less /dashboard served the shell with relative
+        # asset paths ("./assets/..."), so browsers resolved JS/CSS against
+        # "/" -> 404 -> blank white page. Must 308-redirect to /dashboard/.
+        r = client.get("/dashboard")
+        assert r.status_code == 308
+        assert r.headers["Location"].endswith("/dashboard/")
+        # canonical URL serves the shell
+        r2 = client.get("/dashboard/", follow_redirects=False)
+        assert r2.status_code == 200
+        assert b"<div id=\"root\">" in r2.data
 
 
 class TestEgressChain:
@@ -1847,6 +1872,7 @@ class TestEgressChain:
                               "messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code == 200
         assert r.headers["X-Upstream-Via"] == "direct"
+        b"".join(r.response); r.close()  # streaming metrics land on close
         snap = metrics.snapshot()
         assert snap["via"]["direct"] >= 1
         assert snap["models"]["cheap"] >= 1
@@ -1862,6 +1888,7 @@ class TestEgressChain:
                               "messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code == 200
         assert r.headers["X-Upstream-Via"] == "thermoptic"
+        b"".join(r.response); r.close()  # streaming metrics land on close
         assert metrics.snapshot()["features"]["thermoptic"] == 1
 
     def test_thermoptic_down_falls_to_direct(self, client, proxy_mod, monkeypatch):
@@ -1914,6 +1941,7 @@ class TestEgressChain:
         assert r.status_code == 200
         assert r.headers["X-Upstream-Via"] == "ws-local-agent"
         assert b'"content": "Hello"' in r.data
+        b"".join(r.response); r.close()  # streaming metrics land on close
         assert metrics.snapshot()["features"]["ws_fallback"] == 1
 
     def test_ws_fallback_does_not_engage_on_http_error(self, client, proxy_mod, monkeypatch):
@@ -1948,3 +1976,382 @@ class TestEgressChain:
                               "messages": [{"role": "user", "content": "hi"}]})
         assert r.status_code == 502
         assert r.get_json()["error"]["type"] == "network_error"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase-3.1: DSML real-world metrics (research task 8-c schema)
+# ═══════════════════════════════════════════════════════════════════
+
+def _make_jwt(payload):
+    """Offline JWT: b64url(header).b64url(payload).sig — enough for the
+    shim's jti/exp extraction (no signature verification anywhere)."""
+    import base64
+    enc = lambda d: base64.urlsafe_b64encode(
+        json.dumps(d).encode()).decode().rstrip("=")
+    return f"{enc({'alg': 'none'})}.{enc(payload)}.sig"
+
+
+class TestDSMLMetrics:
+    def test_stats_schema_is_superset(self):
+        dsml_shim.reset()
+        s = dsml_shim.stats()
+        # legacy keys keep names/meaning
+        for k in ("enabled", "injections", "buffered_parses",
+                  "stream_calls", "parse_failures"):
+            assert k in s
+        # new keys present + zero-filled
+        for k in ("responses_stream", "responses_buffered",
+                  "responses_stream_hits", "parse_attempts",
+                  "calls_buffered", "finish_overrides",
+                  "tool_results_seen", "markup_leaks", "overhead_ms",
+                  "rates", "calls_stream"):
+            assert k in s, k
+        assert s["markup_leaks"] == {"truncated_flush": 0,
+                                     "oversize_degrade": 0,
+                                     "open_tag_timeout": 0,
+                                     "unparseable_buffered": 0}
+        assert s["rates"]["tool_loop_approximate"] is True
+
+    def test_stream_path_counters(self):
+        dsml_shim.reset()
+        sieve = dsml_shim.DSMLStreamSieve()
+        block = ('<dsml:tool_call id="call_1"><dsml:function>get_weather'
+                 '</dsml:function><dsml:arguments>{"city": "SF"}'
+                 '</dsml:arguments></dsml:tool_call>')
+        for piece in sieve.feed("thinking... " + block):
+            pass
+        dsml_shim.note_response("stream")
+        dsml_shim.note_stream_hit()
+        dsml_shim.note_override()
+        dsml_shim.note_overhead_ms(2.5)
+        s = dsml_shim.stats()
+        assert s["stream_calls"] == 1 and s["calls_stream"] == 1
+        assert s["responses_stream"] == 1 and s["responses_stream_hits"] == 1
+        assert s["finish_overrides"] == 1
+        assert s["overhead_ms"]["window_n"] == 1
+        assert s["rates"]["parse_success_pct"] == 100.0
+
+    def test_truncated_flush_leak(self):
+        dsml_shim.reset()
+        sieve = dsml_shim.DSMLStreamSieve()
+        sieve.feed("prose <dsml:tool_call><dsml:function>run")
+        out = sieve.flush()  # never closed → markup released as prose
+        assert any("content" in p for p in out)
+        assert dsml_shim.stats()["markup_leaks"]["truncated_flush"] == 1
+
+    def test_unparseable_buffered_leak(self):
+        dsml_shim.reset()
+        r = dsml_shim.parse_dsml("<dsml:tool_call>no function here</dsml:tool_call>")
+        assert r is None
+        s = dsml_shim.stats()
+        assert s["markup_leaks"]["unparseable_buffered"] == 1
+        assert s["parse_attempts"] == 1
+
+    def test_buffered_grain_counters(self):
+        dsml_shim.reset()
+        text = ("".join(
+            f'<dsml:tool_call id="c{i}"><dsml:function>fn{i}</dsml:function>'
+            f'<dsml:arguments>{{}}</dsml:arguments></dsml:tool_call>'
+            for i in range(3)))
+        r = dsml_shim.parse_dsml(text)
+        assert r and len(r["tool_calls"]) == 3
+        dsml_shim.note_response("buffered")
+        dsml_shim.note_override()
+        s = dsml_shim.stats()
+        assert s["calls_buffered"] == 3 and s["buffered_parses"] == 1
+        assert s["responses_buffered"] == 1 and s["finish_overrides"] == 1
+
+    def test_oversize_degrade_leak(self):
+        dsml_shim.reset()
+        sieve = dsml_shim.DSMLStreamSieve()
+        sieve.feed('<dsml:tool_call><dsml:function>x</dsml:function>'
+                   '<dsml:arguments>' + "A" * (300000))
+        out = sieve.feed("</dsml:arguments></dsml:tool_call>")  # block still > cap
+        assert dsml_shim.stats()["markup_leaks"]["oversize_degrade"] >= 1
+
+    def test_tool_results_seen(self):
+        dsml_shim.reset()
+        dsml_shim.note_tool_results_seen()
+        assert dsml_shim.stats()["tool_results_seen"] == 1
+
+    def test_reset_clears_everything(self):
+        dsml_shim.note_response("stream"); dsml_shim.note_leak("open_tag_timeout")
+        dsml_shim.note_overhead_ms(9.0)
+        dsml_shim.reset()
+        s = dsml_shim.stats()
+        assert s["responses_stream"] == 0
+        assert s["markup_leaks"]["open_tag_timeout"] == 0
+        assert s["overhead_ms"]["window_n"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase-3.1: metrics persistence + hygiene (research 8-b items 1-5)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestMetricsPersistence:
+    @pytest.fixture
+    def persist_env(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(metrics, "_PERSIST_PATH",
+                            str(tmp_path / "metrics_state.json"))
+        monkeypatch.setattr(metrics, "_persistence_disabled", False)
+        monkeypatch.setattr(metrics, "_flusher_started", True)  # no threads
+        metrics.reset()
+        return tmp_path
+
+    def test_roundtrip(self, persist_env):
+        metrics.record("/v1/chat/completions", 200, via="direct",
+                       latency_ms=12.0, client_ip="1.2.3.4", model="m1",
+                       stream=False, feature="dsml_shim")
+        assert metrics.flush()
+        raw = json.load(open(persist_env / "metrics_state.json"))
+        assert raw["schema"] == 1 and raw["totals"]["requests"] == 1
+        metrics.reset()  # wipe, then restore
+        assert metrics.snapshot()["totals"]["requests"] == 0
+        assert metrics._load_state()
+        snap = metrics.snapshot()
+        assert snap["totals"]["requests"] == 1
+        assert snap["features"]["dsml_shim"] == 1
+        assert snap["request_log"][0]["route"] == "/v1/chat/completions"
+
+    def test_corrupt_file_renamed_aside(self, persist_env):
+        p = persist_env / "metrics_state.json"
+        p.write_text("{not json at all", encoding="utf-8")
+        assert metrics._load_state() is False
+        assert not p.exists()          # renamed aside
+        assert list(persist_env.glob("metrics_state.json.corrupt-*"))
+
+    def test_schema_mismatch_discarded(self, persist_env):
+        p = persist_env / "metrics_state.json"
+        json.dump({"schema": 999, "totals": {}}, open(p, "w"))
+        assert metrics._load_state() is False
+        assert not p.exists()
+
+    def test_clients_cap_eviction(self, monkeypatch):
+        monkeypatch.setattr(metrics, "CLIENTS_CAP", 5)
+        metrics.reset()
+        for i in range(8):
+            metrics.record("/v1/chat/completions", 200,
+                           client_ip=f"10.0.0.{i}")
+        snap = metrics.snapshot()
+        assert snap["client_count"] == 5  # LRU by last_seen, never grows
+
+    def test_rollups_record_and_compact(self, persist_env):
+        metrics.record("/v1/chat/completions", 500, via="direct",
+                       latency_ms=30.0)
+        snap = metrics.snapshot()
+        assert snap["rollups"], "current-hour bucket present"
+        bucket = snap["rollups"][-1]
+        assert bucket["requests"] == 1 and bucket["errors"] == 1
+        assert bucket["lat_avg_ms"] == 30.0
+
+    def test_feature_models_cross_label(self, persist_env):
+        metrics.record("/v1/chat/completions", 200, model="glm-4.5-air",
+                       feature="dsml_shim")
+        metrics.record("/v1/chat/completions", 200, model="glm-4.5-air",
+                       feature="dsml_shim")
+        metrics.record("/v1/chat/completions", 200, model="glm-4.6",
+                       feature="dsml_shim")
+        snap = metrics.snapshot()
+        assert snap["feature_models"]["dsml_shim|glm-4.5-air"] == 2
+        assert snap["feature_models"]["dsml_shim|glm-4.6"] == 1
+
+    def test_persistence_info_shape(self, persist_env):
+        info = metrics.persistence_info()
+        assert info["enabled"] is True and info["rollup_retention_h"] >= 1
+        assert info["path"].endswith("metrics_state.json")
+
+    def test_io_error_disables_persist_fail_safe(self, persist_env, monkeypatch):
+        # Point at a directory that cannot exist (a file used as a dir).
+        blocker = persist_env / "blocker"
+        blocker.write_text("x")
+        monkeypatch.setattr(metrics, "_PERSIST_PATH",
+                            str(blocker / "nested" / "state.json"))
+        assert metrics.flush() is False          # atomic write fails...
+        assert metrics._persistence_disabled is True
+        metrics.record("/v1/chat/completions", 200)  # ...but record survives
+        assert metrics.snapshot()["totals"]["requests"] == 1
+
+
+class TestTelemetryHygiene:
+    def test_health_not_recorded(self, client):
+        metrics.reset()
+        client.get("/health")
+        snap = metrics.snapshot()
+        assert all(e["route"] != "/health" for e in snap["request_log"])
+        assert snap["totals"]["requests"] == 0
+
+    def test_dashboard_payload_has_dsml_block(self, client):
+        r = client.get("/api/dashboard/state")
+        assert r.status_code == 200
+        body = r.get_json()
+        assert "dsml" in body and "rates" in body["dsml"]
+        assert body["health_mini"]["dsml_enabled"] is True
+        assert "feature_models" in body and "rollups" in body
+
+    def test_streaming_latency_recorded_after_close(self, client,
+                                                    proxy_mod, monkeypatch):
+        monkeypatch.setattr(owl_bridge, "owl_enabled", lambda: False)
+        monkeypatch.setattr(proxy_mod.req_lib, "post",
+                            lambda *a, **kw: FakeDirectResp())
+        metrics.reset()
+        r = client.post("/v1/chat/completions",
+                        json={"model": "cheap", "stream": True,
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 200
+        assert b"".join(r.response)  # consume the stream → close fires
+        r.close()
+        snap = metrics.snapshot()
+        assert snap["totals"]["stream"] == 1
+        assert snap["totals"]["requests"] == 1
+        assert snap["via"]["direct"] >= 1
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase-3.1: Synergy 7 — token import (server-first no-CloakBrowser)
+# ═══════════════════════════════════════════════════════════════════
+
+class TestTokenImport:
+    @pytest.fixture(autouse=True)
+    def _fresh_token_store(self, monkeypatch, tmp_path):
+        """auth's 5s cache is process-global: point it at a per-test file
+        and bust the cache or earlier tests' data leaks into imports."""
+        import auth as _auth
+        monkeypatch.setattr("auth.TOKENS_FILE", str(tmp_path / "tokens.json"))
+        _auth._token_cache = None
+        _auth._token_cache_ts = 0.0
+        yield
+        _auth._token_cache = None
+
+    def test_detect_formats(self):
+        assert token_import.detect_format(
+            {"email": "a@b", "access_token": "x", "refresh_token": "r",
+             "device_id": "d"}) == "autoclaw2api"
+        assert token_import.detect_format(
+            {"access_token": "x", "refresh_token": "r"}) == "desktop-ls"
+        assert token_import.detect_format(
+            {"accounts": [{"access_token": "x"}]}) == "tokens-json"
+        assert token_import.detect_format({"nope": 1}) is None
+
+    def test_import_autoclaw2api_with_jti_email(self, monkeypatch, tmp_path):
+        jwt = _make_jwt({"jti": "user@example.com", "exp": time.time() + 3600})
+        r = token_import.import_record({
+            "email": "user@example.com",
+            "access_token": jwt, "refresh_token": "rt",
+            "user_id": "u1", "device_id": "desktop-dev-42",
+            "source_id": "autoclaw"})
+        assert r["ok"] and r["action"] == "imported"
+        assert r["email"] == "user@example.com"
+        assert any("preserved desktop device_id" in w for w in r["warnings"])
+        from auth import load_tokens
+        acc = load_tokens()["accounts"][0]
+        assert acc["device_id"] == "desktop-dev-42"
+        assert acc["source_id"] == "autoclaw"
+
+    def test_missing_device_id_mints_with_warning(self, monkeypatch, tmp_path):
+        jwt = _make_jwt({"jti": "user2@example.com"})
+        r = token_import.import_record(
+            {"access_token": jwt, "refresh_token": "rt"})
+        assert r["ok"]
+        assert any("missing device_id" in w for w in r["warnings"])
+        from auth import load_tokens
+        assert load_tokens()["accounts"][0]["device_id"]
+
+    def test_dedupe_email_updates(self, monkeypatch, tmp_path):
+        rec = {"email": "d@example.com", "access_token": "tk",
+               "refresh_token": "rt1", "device_id": "d1"}
+        assert token_import.import_record(dict(rec))["action"] == "imported"
+        r2 = token_import.import_record(
+            {**rec, "refresh_token": "rt2"})
+        assert r2["action"] == "updated"
+        from auth import load_tokens
+        accounts = load_tokens()["accounts"]
+        assert len(accounts) == 1 and accounts[0]["refresh_token"] == "rt2"
+
+    def test_rejected_record_counts(self, monkeypatch, tmp_path):
+        r = token_import.import_record({"nothing": True})
+        assert not r["ok"] and "access_token" in r["error"]
+        st = token_import.stats()
+        assert st["rejected"] == 1 and st["last_error"]
+
+    def test_import_payload_shapes(self, monkeypatch, tmp_path):
+        # tokens.json fragment
+        s1 = token_import.import_payload({"accounts": [
+            {"email": "f1@x", "access_token": "a", "refresh_token": "r",
+             "device_id": "d"}]})
+        assert s1["imported"] == 1
+        # bare list
+        s2 = token_import.import_payload([
+            {"email": "f2@x", "access_token": "a", "refresh_token": "r",
+             "device_id": "d"}])
+        assert s2["imported"] == 1
+        # single dict
+        s3 = token_import.import_payload(
+            {"email": "f3@x", "access_token": "a", "refresh_token": "r",
+             "device_id": "d"})
+        assert s3["imported"] == 1
+
+    def test_import_directory(self, monkeypatch, tmp_path):
+        d = tmp_path / "imports"; d.mkdir()
+        (d / "acc1.json").write_text(json.dumps(
+            {"email": "dir1@x", "access_token": "a",
+             "refresh_token": "r", "device_id": "d"}))
+        (d / "bad.json").write_text("{broken", encoding="utf-8")
+        (d / "notjson.txt").write_text("skip me", encoding="utf-8")
+        out = token_import.import_directory(str(d))
+        assert out["files"] == 2 and out["imported"] == 1
+        assert out["errors"] and "bad.json" in out["errors"][0]
+
+    def test_oauth_mode_resolution(self, monkeypatch):
+        monkeypatch.setenv("ACLAW_OAUTH_MODE", "import")
+        assert token_import.oauth_mode() == "import"
+        monkeypatch.setenv("ACLAW_OAUTH_MODE", "bogus")
+        assert token_import.oauth_mode() == "auto"
+        monkeypatch.setenv("ACLAW_NO_BROWSER", "1")
+        assert token_import.no_browser() is True
+
+    def test_login_url_disabled_in_import_mode(self, client, monkeypatch):
+        monkeypatch.setenv("ACLAW_OAUTH_MODE", "import")
+        r = client.post("/api/login-url", json={})
+        assert r.status_code == 409
+        body = r.get_json()
+        assert body["error"] == "browser_login_disabled"
+        assert "/api/tokens/import" in body["detail"]["hint"]
+
+    def test_login_url_405_reports_deprecation(self, client, monkeypatch):
+        monkeypatch.setenv("ACLAW_OAUTH_MODE", "auto")
+        import proxy as proxy_module
+        monkeypatch.setattr("auth.google_oauth_url",
+                            lambda proxy=None: (
+                                None, None, None,
+                                {"http_status": 405, "code": 405}))
+        r = client.post("/api/login-url", json={})
+        assert r.status_code == 502
+        assert r.get_json()["error"] == "upstream_oauth_deprecated"
+        st = client.get("/api/tokens/import/status").get_json()
+        assert st["oauth_upstream"] == "405"
+
+    def test_import_api_routes(self, flask_env, monkeypatch, tmp_path):
+        monkeypatch.setattr(flask_env, "PROXY_API_KEY", "sekrit")
+        c = flask_env.app.test_client()
+        # unauthorized
+        r = c.post("/api/tokens/import", json={})
+        assert r.status_code == 401
+        # authorized
+        r = c.post("/api/tokens/import",
+                   headers={"Authorization": "Bearer sekrit"},
+                   json={"email": "api@x", "access_token": "a",
+                         "refresh_token": "r", "device_id": "d"})
+        assert r.status_code == 200
+        assert r.get_json()["imported"] == 1
+        # status endpoint
+        r = c.get("/api/tokens/import/status",
+                  headers={"Authorization": "Bearer sekrit"})
+        assert r.status_code == 200
+        assert r.get_json()["imported"] == 1
+
+    def test_health_includes_token_import_block(self, client):
+        r = client.get("/health")
+        assert r.status_code == 200
+        body = r.get_json()
+        assert "token_import" in body
+        assert "mode" in body["token_import"]

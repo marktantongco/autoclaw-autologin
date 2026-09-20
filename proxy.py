@@ -17,7 +17,7 @@ import time
 import uuid
 import threading
 import logging
-from flask import Flask, request, Response, jsonify, g
+from flask import Flask, request, Response, jsonify, g, redirect
 import requests as req_lib
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -67,6 +67,7 @@ import dsml_shim
 import metrics
 import ws_fallback
 import thermoptic_bridge
+import token_import  # Synergy 7 (Phase-3.1): no-CloakBrowser import mode
 
 # ─── Structured Logging ──────────────────────────────────────────────
 logger = logging.getLogger("autoclaw.proxy")
@@ -89,7 +90,10 @@ def _metrics_before():
 
 # Routes excluded from metrics (static assets / dashboard self-polling —
 # recording them would just add noise to the operator's own dashboard).
-_METRICS_SKIP_PREFIXES = ("/ui", "/dashboard", "/api/dashboard", "/static", "/favicon")
+# /health is excluded too (Phase-3.1): external uptime monitors polling it
+# polluted the request log / latency window (research 8-b W13).
+_METRICS_SKIP_PREFIXES = ("/ui", "/dashboard", "/api/dashboard", "/static",
+                          "/favicon", "/health")
 
 
 @app.after_request
@@ -106,17 +110,49 @@ def _owl_via_header(resp):
         path = request.path
         if not path.startswith(_METRICS_SKIP_PREFIXES):
             via = g.get("_upstream_via") or ("local" if not path.startswith("/v1/") else "direct")
-            metrics.record(
-                route=path,
-                status=resp.status_code,
-                via=via,
-                latency_ms=(time.time() - g.get("_request_start", time.time())) * 1000.0,
-                client_ip=g.get("_client_ip"),
-                model=g.get("_model"),
-                stream=bool(g.get("_wants_stream")),
-                block=g.get("_metrics_block"),
-                feature=g.get("_metrics_feature"),
-            )
+            # Phase-3.1 (research 8-b W4): for streaming responses,
+            # after_request fires when the SSE Response OBJECT is created —
+            # i.e. time-to-first-byte — so recording here understates real
+            # chat duration. Defer the record to stream close instead;
+            # closure captures everything (request context is gone by then).
+            if bool(g.get("_wants_stream")) and path.startswith("/v1/"):
+                _vals = {
+                    "route": path,
+                    "status": resp.status_code,
+                    "via": via,
+                    "client_ip": g.get("_client_ip"),
+                    "model": g.get("_model"),
+                    "block": g.get("_metrics_block"),
+                    "feature": g.get("_metrics_feature"),
+                }
+                _start = g.get("_request_start", time.time())
+
+                def _record_stream(_v=_vals, _s=_start):
+                    try:
+                        metrics.record(
+                            route=_v["route"], status=_v["status"],
+                            via=_v["via"],
+                            latency_ms=(time.time() - _s) * 1000.0,
+                            client_ip=_v["client_ip"], model=_v["model"],
+                            stream=True, block=_v["block"],
+                            feature=_v["feature"],
+                        )
+                    except Exception:
+                        pass
+
+                resp.call_on_close(_record_stream)
+            else:
+                metrics.record(
+                    route=path,
+                    status=resp.status_code,
+                    via=via,
+                    latency_ms=(time.time() - g.get("_request_start", time.time())) * 1000.0,
+                    client_ip=g.get("_client_ip"),
+                    model=g.get("_model"),
+                    stream=bool(g.get("_wants_stream")),
+                    block=g.get("_metrics_block"),
+                    feature=g.get("_metrics_feature"),
+                )
     except Exception:
         pass
     return resp
@@ -484,6 +520,18 @@ def chat_completions():
         upstream_body["messages"] = list(upstream_body["messages"])
         _inject_system_banner(upstream_body["messages"])
 
+    # ── Phase-3.1 DSML real-world metric: approximate tool-loop signal ──
+    # role:"tool" messages mean the client dispatched SOME tool (native or
+    # shim-synthesised) earlier in this conversation. Fleet-level signal
+    # only — never presented as a per-call completion rate (research 8-c).
+    try:
+        if isinstance(body.get("messages"), list) and any(
+                isinstance(m, dict) and m.get("role") == "tool"
+                for m in body["messages"]):
+            dsml_shim.note_tool_results_seen()
+    except Exception:
+        pass
+
     # ── Synergy 8 (Phase 2): DSML tool-calling shim (request side) ──
     # Source: tt-52101/chat-z-ai-proxy-web2api-free. When the client sends
     # OpenAI `tools`, describe them in a DSML protocol block appended after
@@ -498,6 +546,10 @@ def chat_completions():
     if dsml_active and isinstance(upstream_body.get("messages"), list):
         dsml_shim.inject_tool_protocol(
             upstream_body["messages"], tools, body.get("tool_choice"))
+        # Phase-3.1: the flagship shim finally shows up in the dashboard's
+        # Feature activations (research 8-b W2 — the counter existed but was
+        # never wired).
+        g._metrics_feature = "dsml_shim"
         logger.info(
             f"DSML shim active: {len(tools)} tool(s), "
             f"tool_choice={body.get('tool_choice', 'auto')}")
@@ -708,6 +760,27 @@ def chat_completions():
             # back possible <dsml:tool_call> starts, and converts completed
             # blocks into OpenAI streaming tool_calls deltas.
             sieve = dsml_shim.DSMLStreamSieve() if dsml_active else None
+            # Phase-3.1: per-response shim overhead accumulation (ms spent
+            # inside sieve.feed/flush — the price of holdback/release).
+            _shim_ms = [0.0]
+            _stream_noted = [False]
+
+            def _note_stream_done():
+                # Exactly-once per streaming response (both terminal paths).
+                if sieve is None or _stream_noted[0]:
+                    return
+                _stream_noted[0] = True
+                if _shim_ms[0] > 0:
+                    dsml_shim.note_overhead_ms(_shim_ms[0])
+                dsml_shim.note_response("stream")
+                if sieve.saw_tool_calls:
+                    dsml_shim.note_stream_hit()
+
+            def _sieved_feed(text):
+                t0 = time.perf_counter()
+                pieces = sieve.feed(text)
+                _shim_ms[0] += (time.perf_counter() - t0) * 1000.0
+                return pieces
 
             def _sse(piece):
                 return b"data: " + json.dumps(
@@ -726,8 +799,11 @@ def chat_completions():
                                 # strict OpenAI clients.
                                 # v2.2.0: drain any held-back DSML tail first.
                                 if sieve is not None:
+                                    t0 = time.perf_counter()
                                     for piece in sieve.flush():
                                         yield _sse(piece)
+                                    _shim_ms[0] += (time.perf_counter() - t0) * 1000.0
+                                _note_stream_done()
                                 yield line + b"\n\n"
                                 return
                             try:
@@ -749,14 +825,17 @@ def chat_completions():
                                     # untouched; only textual content is sieved.
                                     if sieve is not None:
                                         if delta.get("content"):
-                                            pieces = sieve.feed(
+                                            pieces = _sieved_feed(
                                                 delta.pop("content"))
                                         if choices[0].get("finish_reason"):
+                                            t0 = time.perf_counter()
                                             pieces += sieve.flush()
+                                            _shim_ms[0] += (time.perf_counter() - t0) * 1000.0
                                             if sieve.saw_tool_calls:
                                                 # synthesised calls arrived —
                                                 # fix the terminal reason
                                                 choices[0]["finish_reason"] = "tool_calls"
+                                                dsml_shim.note_override()
                                     # Skip chunks with empty content and no tool_calls (pure thinking)
                                     has_content = bool(delta.get("content"))
                                     has_tool_calls = bool(delta.get("tool_calls"))
@@ -776,6 +855,7 @@ def chat_completions():
                             except (json.JSONDecodeError, KeyError):
                                 yield line + b"\n\n"
                 yield b"data: [DONE]\n\n"
+                _note_stream_done()
             return Response(
                 generate(),
                 mimetype="text/event-stream",
@@ -837,7 +917,12 @@ def chat_completions():
             # into a real OpenAI tool_calls message.
             dsml_result = None
             if dsml_active and not full_tool_calls:
+                t0 = time.perf_counter()
                 dsml_result = dsml_shim.parse_dsml(full_content)
+                dsml_shim.note_overhead_ms((time.perf_counter() - t0) * 1000.0)
+                dsml_shim.note_response("buffered")
+                if dsml_result:
+                    dsml_shim.note_override()
 
             message = {"role": "assistant", "content": None}
             if dsml_result:
@@ -911,6 +996,9 @@ def health():
         "ws_fallback": ws_fallback.stats(),
         "thermoptic": thermoptic_bridge.stats(),
         "metrics": metrics.stats(),
+        "metrics_persistence": metrics.persistence_info(),
+        # Synergy 7 (Phase-3.1): no-CloakBrowser import mode
+        "token_import": token_import.stats(),
     })
 
 
@@ -1151,7 +1239,23 @@ def ui_static(path):
 def api_login_url():
     """Generate Google OAuth URL for browser-based login.
     Stores pending state → auto-captured when /auth/callback-google is hit.
+
+    Phase-3.1 (Synergy 7): gated by ACLAW_OAUTH_MODE. The upstream OAuth
+    URL route is 405-deprecated (live-probed 2026-09-19); in auto mode the
+    failure is reported with an actionable import hint.
     """
+    mode = token_import.oauth_mode()
+    if mode in ("import", "none") or token_import.no_browser():
+        token_import.note_oauth_upstream("405")
+        return jsonify({
+            "error": "browser_login_disabled",
+            "detail": {
+                "mode": "no-browser" if token_import.no_browser() else mode,
+                "hint": "use POST /api/tokens/import (desktop-extracted "
+                        "tokens) or drop files in ACLAW_IMPORT_DIR",
+                "upstream_oauth": token_import.stats().get("oauth_upstream"),
+            },
+        }), 409
     from auth import google_oauth_url, _next_proxy
     # Get proxy BEFORE calling google_oauth_url so we can reuse it for token exchange
     proxy_used = _next_proxy()
@@ -1160,10 +1264,76 @@ def api_login_url():
         _pending_logins[state] = {"device_id": device_id, "result": None, "error": None, "proxy": proxy_used}
         return jsonify({"oauth_url": oauth_url, "state": state, "device_id": device_id})
     # err_info = {"code": 400005, "msg": "Limit error", "retried": 5}
+    # Phase-3.1: an upstream 405 means the browser harvest route is dead —
+    # record it and point the operator at the import path.
+    if isinstance(err_info, dict) and err_info.get("http_status") == 405:
+        token_import.note_oauth_upstream("405")
+        return jsonify({
+            "error": "upstream_oauth_deprecated",
+            "detail": {
+                "http_status": 405,
+                "hint": "the upstream OAuth route is gone for all forks — "
+                        "use POST /api/tokens/import (desktop-extracted tokens)",
+            },
+        }), 502
     return jsonify({
         "error": "Failed to get OAuth URL",
         "detail": err_info,
     }), 500
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Synergy 7 (Phase-3.1): token import API — server-first no-CloakBrowser
+# mode. Imports desktop-extracted credentials (single record, batch list,
+# or tokens.json fragment). Authenticated by AUTOCLAW_PROXY_API_KEY when
+# configured (writing tokens is privileged).
+# ──────────────────────────────────────────────────────────────────────
+
+def _import_guard():
+    """Shared auth guard for import routes. Returns error response or None."""
+    if PROXY_API_KEY:
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {PROXY_API_KEY}":
+            return jsonify({"error": {"message": "Invalid API key",
+                                      "type": "auth_error"}}), 401
+    return None
+
+
+@app.route("/api/tokens/import", methods=["POST"])
+def api_tokens_import():
+    """Import one credential record (or a list / tokens.json fragment)."""
+    guard = _import_guard()
+    if guard:
+        return guard
+    payload = request.get_json(force=True, silent=True)
+    if payload is None:
+        return jsonify({"error": {"message": "JSON body required",
+                                  "type": "invalid_request_error"}}), 400
+    summary = token_import.import_payload(payload, source="api")
+    return jsonify(summary), (200 if summary["rejected"] == 0 else 207)
+
+
+@app.route("/api/tokens/import/batch", methods=["POST"])
+def api_tokens_import_batch():
+    """Batch alias — identical semantics to POST /api/tokens/import."""
+    return api_tokens_import()
+
+
+@app.route("/api/tokens/import/status", methods=["GET"])
+def api_tokens_import_status():
+    """Import subsystem status: counters + optional app-login probe."""
+    st = token_import.stats()
+    st["applogin_probe"] = token_import.applogin_probe()
+    return jsonify(st)
+
+
+@app.route("/api/tokens/import/run", methods=["POST"])
+def api_tokens_import_run():
+    """Trigger a watch-directory ingestion pass on demand."""
+    guard = _import_guard()
+    if guard:
+        return guard
+    return jsonify(token_import.import_directory())
 
 
 @app.route("/auth/callback-google")
@@ -1357,6 +1527,14 @@ DASHBOARD_DIR = os.path.join(
 
 
 @app.route("/dashboard")
+def dashboard_index_noslash():
+    # Vite build uses a relative asset base ("./assets/..."); serving the shell
+    # at slash-less "/dashboard" makes the browser resolve assets against "/"
+    # (-> 404, blank page). Canonicalize to "/dashboard/" so relative paths
+    # resolve under /dashboard/assets/. 308 keeps the method (GET/POST-safe).
+    return redirect("/dashboard/", code=308)
+
+
 @app.route("/dashboard/")
 def dashboard_index():
     return send_from_directory(DASHBOARD_DIR, "index.html")
@@ -1377,6 +1555,7 @@ def _dashboard_health_mini():
             "thermoptic_healthy": thermoptic_bridge.healthy(),
             "ws_fallback_ready": ws_fallback.available(),
             "backend_pref": metrics.backend_pref(),
+            "dsml_enabled": dsml_shim.enabled(),
         }
     except Exception:
         return {}
@@ -1387,6 +1566,7 @@ def dashboard_state():
     """Full metrics snapshot (REST fallback for the WebSocket stream)."""
     snap = metrics.snapshot()
     snap["health_mini"] = _dashboard_health_mini()
+    snap["dsml"] = dsml_shim.stats()  # Phase-3.1: DSML real-world panel
     return jsonify(snap)
 
 
@@ -1432,23 +1612,52 @@ except Exception as _e:  # pragma: no cover — exercised only without the dep
     _sock = None
 
 if _sock is not None:
+    # Phase-3.1 (research 8-b W10): WS keepalive + concurrent-client cap.
+    # Dead peers (laptop sleep) used to hold worker threads until TCP
+    # timeout; now a ping/pong probe runs each push cycle and the cap
+    # bounds concurrent streams.
+    _WS_CLIENT_CAP = int(os.environ.get("ACLAW_DASH_WS_CAP", "20"))
+    _ws_clients = {"n": 0}
+    _ws_clients_lock = threading.Lock()
+
     @_sock.route("/api/dashboard/stream")
     def dashboard_stream(ws):
         """Push a metrics snapshot every second; sender-closed detection
         relies on send() raising when the peer disconnects."""
         import simple_websocket
+        with _ws_clients_lock:
+            _ws_clients["n"] += 1
+            over_cap = _ws_clients["n"] > _WS_CLIENT_CAP
+        if over_cap:
+            try:
+                ws.send(json.dumps({"error": "too_many_clients",
+                                    "cap": _WS_CLIENT_CAP}))
+                ws.close(1013)  # try again later
+            except Exception:
+                pass
+            with _ws_clients_lock:
+                _ws_clients["n"] -= 1
+            return
         try:
             ws.send(json.dumps({"hello": True,
                                 "version": VERSION}))
             while True:
                 snap = metrics.snapshot()
                 snap["health_mini"] = _dashboard_health_mini()
+                snap["dsml"] = dsml_shim.stats()
                 ws.send(json.dumps(snap))
                 time.sleep(1.0)
+                try:  # keepalive probe — raises if the peer is gone
+                    ws.ping()
+                except AttributeError:
+                    pass  # older simple-websocket without ping()
         except simple_websocket.ConnectionClosed:
             pass
         except Exception as e:
             logger.debug(f"dashboard stream closed: {e}")
+        finally:
+            with _ws_clients_lock:
+                _ws_clients["n"] = max(0, _ws_clients["n"] - 1)
 
 
 if __name__ == "__main__":
@@ -1458,6 +1667,19 @@ if __name__ == "__main__":
     logger.info(f"API: http://localhost:{PROXY_PORT}/v1/chat/completions")
     logger.info(f"Models: {', '.join(MODEL_MAP.keys())}")
     list_accounts()
+
+    # Phase-3.1: restore persisted telemetry (load-on-boot) + start flusher
+    if metrics.init():
+        logger.info("Dashboard telemetry restored from metrics_state.json")
+
+    # Synergy 7: ingest the token import watch-dir at boot
+    if os.environ.get("ACLAW_IMPORT_ON_START", "1").strip().lower() not in (
+            "0", "false", "no", "off"):
+        imp = token_import.import_directory()
+        if imp.get("files"):
+            logger.info(f"Token import: {imp['files']} file(s) -> "
+                        f"+{imp['imported']} new, {imp['updated']} updated, "
+                        f"{imp['rejected']} rejected")
 
     # Start background wallet checker (every 5 min, non-blocking)
     wallet_thread = threading.Thread(target=_bg_wallet_checker, daemon=True)

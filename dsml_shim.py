@@ -36,7 +36,9 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
+from collections import deque
 
 _ENABLED = os.environ.get("AUTOCLAW_DSML_ENABLED", "1").strip().lower() not in (
     "0", "false", "no", "off")
@@ -54,8 +56,91 @@ _ARGS_RE = re.compile(r"(?is)<dsml:arguments[^>]*>(.*?)</dsml:arguments>")
 _ID_ATTR_RE = re.compile(r"""(?is)\bid\s*=\s*["']([^"']*)["']""")
 
 _LOCK = threading.Lock()
+# Legacy counters keep their names/meaning (health consumers + smoke test).
+# Phase-3.1 additions (research task 8-c): grain-correct denominators, the
+# leak taxonomy, finish overrides and the tool-loop approximation.
 _STATS = {"injections": 0, "buffered_parses": 0, "stream_calls": 0,
-          "parse_failures": 0}
+          "parse_failures": 0,
+          "responses_stream": 0, "responses_stream_hits": 0,
+          "responses_buffered": 0,
+          "parse_attempts": 0, "calls_buffered": 0,
+          "finish_overrides": 0, "tool_results_seen": 0}
+_LEAKS = {"truncated_flush": 0, "oversize_degrade": 0,
+          "open_tag_timeout": 0, "unparseable_buffered": 0}
+_OVERHEAD_MS = deque(maxlen=60)   # shim-added latency ring (last 60 responses)
+
+
+def _note(key, n=1):
+    """Fail-safe counter bump. Never raises; unknown keys are ignored."""
+    try:
+        with _LOCK:
+            if key in _STATS:
+                _STATS[key] += n
+    except Exception:
+        pass
+
+
+def note_response(path):
+    """Count a shim-processed response: path 'stream' or 'buffered'.
+
+    Call AFTER the response completed; `hits=True` variants are tracked via
+    note_stream_hit() so parse-success rates stay response-grain honest.
+    """
+    _note("responses_stream" if path == "stream" else "responses_buffered")
+
+
+def note_stream_hit():
+    """A streaming shim response produced at least one tool call."""
+    _note("responses_stream_hits")
+
+
+def note_parse_attempt():
+    """Buffered path: markup was present, a parse will be attempted."""
+    _note("parse_attempts")
+
+
+def note_calls_buffered(n):
+    """Buffered path produced n call-grain tool_calls (grain parity with
+    stream_calls)."""
+    _note("calls_buffered", n)
+
+
+def note_override():
+    """finish_reason was overridden to 'tool_calls' (client-visible action)."""
+    _note("finish_overrides")
+
+
+def note_tool_results_seen():
+    """Request carried role:'tool' messages (APPROXIMATE round-trip signal:
+    also fires for native tool calls; fleet-level only, never per-call)."""
+    _note("tool_results_seen")
+
+
+def note_leak(reason):
+    """A detected markup-leak incident. Reasons: truncated_flush
+    (stream block never closed), oversize_degrade (block > 256 KiB),
+    open_tag_timeout (open tag never completed), unparseable_buffered
+    (buffered markup with zero parseable blocks). Detected leaks only —
+    malformed-but-scrubbed fragments are not observable proxy-side."""
+    try:
+        with _LOCK:
+            if reason in _LEAKS:
+                _LEAKS[reason] += 1
+    except Exception:
+        pass
+
+
+def note_overhead_ms(ms):
+    """Record shim-added latency (sieve feed/flush + buffered parse wall
+    time) into the 60-sample ring. Mirrors LiteLLM's overhead-latency
+    histogram concept."""
+    try:
+        if ms is None or ms != ms or ms < 0 or ms > 60000:
+            return
+        with _LOCK:
+            _OVERHEAD_MS.append(float(ms))
+    except Exception:
+        pass
 
 
 def enabled():
@@ -201,6 +286,8 @@ def parse_dsml(text):
     """
     if not text or _OPEN_TAG not in text.lower():
         return None
+    with _LOCK:
+        _STATS["parse_attempts"] += 1
     used = set()
     tool_calls = []
     for m in _BLOCK_RE.finditer(text):
@@ -211,7 +298,13 @@ def parse_dsml(text):
         if call:
             tool_calls.append(call)
     if not tool_calls:
+        # Markup was present but zero blocks parsed — the whole text
+        # (markup included) passes through to the client: a detected leak.
+        with _LOCK:
+            _LEAKS["unparseable_buffered"] += 1
         return None
+    with _LOCK:
+        _STATS["calls_buffered"] += len(tool_calls)
     content = _BLOCK_RE.sub("", text)
     content = re.sub(r"\n{3,}", "\n\n", content).strip()
     with _LOCK:
@@ -292,6 +385,8 @@ class DSMLStreamSieve:
                     gt = self._buf.find(">")
                     if gt == -1:
                         if len(self._buf) > _MAX_OPEN_TAG_WAIT:
+                            with _LOCK:
+                                _LEAKS["open_tag_timeout"] += 1
                             out.append({"content": "<"})
                             self._buf = self._buf[1:]
                             continue
@@ -308,6 +403,8 @@ class DSMLStreamSieve:
                 if j == -1:
                     if len(self._buf) > _MAX_BLOCK_BUFFER:
                         # pathological unclosed block — degrade to prose
+                        with _LOCK:
+                            _LEAKS["oversize_degrade"] += 1
                         out.append({"content": self._open_tag + self._buf})
                         self._buf = ""
                         self._capturing = False
@@ -330,6 +427,10 @@ class DSMLStreamSieve:
             raw = self._open_tag + self._buf
             if raw:
                 out.append({"content": raw})
+                # A capturing block that never closed releases its markup as
+                # prose: a detected leak (stream path).
+                with _LOCK:
+                    _LEAKS["truncated_flush"] += 1
         elif self._buf:
             out.append({"content": self._buf})
         self._buf = ""
@@ -342,11 +443,47 @@ class DSMLStreamSieve:
 # Observability
 # ──────────────────────────────────────────────────────────────────────────
 
+def _pct(num, den):
+    return round(num * 100.0 / den, 1) if den else 0.0
+
+
 def stats():
-    """Observability block for /health. Never raises."""
+    """Observability block for /health + dashboard payload. Never raises.
+
+    Superset of the legacy shape: legacy keys keep names/meaning; new keys
+    are additive so consumers can index blindly.
+    """
     try:
         with _LOCK:
-            return {"enabled": _ENABLED, **_STATS}
+            s = {"enabled": _ENABLED, **_STATS,
+                 "markup_leaks": dict(_LEAKS)}
+            ov = sorted(_OVERHEAD_MS)
+            window = [round(x, 2) for x in _OVERHEAD_MS]
+        n = len(ov)
+        if n:
+            avg = sum(ov) / n
+            p95 = ov[min(n - 1, int(round(0.95 * (n - 1))))]
+            s["overhead_ms"] = {"avg": round(avg, 2), "p95": round(p95, 2),
+                                "window_n": n, "window": window}
+        else:
+            s["overhead_ms"] = {"avg": 0.0, "p95": 0.0, "window_n": 0,
+                                "window": []}
+        # rates (computed, never stored) — response-grain honesty:
+        attempted = s["parse_attempts"] + s["responses_stream"]
+        hits = s["buffered_parses"] + s["responses_stream_hits"]
+        shimmed = s["responses_stream"] + s["responses_buffered"]
+        leaks_total = sum(_LEAKS.values())
+        with_calls = s["buffered_parses"] + s["responses_stream_hits"]
+        s["rates"] = {
+            "parse_success_pct": _pct(hits, attempted),
+            "leak_rate_pct": _pct(leaks_total, shimmed),
+            "tool_loop_pct": _pct(s["tool_results_seen"], with_calls),
+            # role:"tool" also occurs for native calls — fleet-level signal
+            # only, never a per-call completion rate.
+            "tool_loop_approximate": True,
+        }
+        s["calls_stream"] = s["stream_calls"]  # grain-consistent alias
+        return s
     except Exception as exc:  # pragma: no cover — defensive
         return {"enabled": _ENABLED, "error": str(exc)}
 
@@ -356,3 +493,6 @@ def reset():
     with _LOCK:
         for k in _STATS:
             _STATS[k] = 0
+        for k in _LEAKS:
+            _LEAKS[k] = 0
+        _OVERHEAD_MS.clear()

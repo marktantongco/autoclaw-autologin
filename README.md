@@ -289,6 +289,43 @@ turn resets the streak — legitimate long conversations are never killed.
 | `AUTOCLAW_LOOP_TTL` | `3600` | Streak memory (s) |
 | `AUTOCLAW_CONTEXT_WINDOW` | *(per-model)* | Global context-window override |
 
+## 🧩 Phase 3.1 — Synergy #7 Import Mode, DSML Real-World Metrics, Dashboard Tuning (v2.4.0)
+
+The upstream OAuth URL route is **405-deprecated** (live-probed; all forks
+affected). Synergy #7 — the deferred no-CloakBrowser mode — is therefore the
+token-supply lifeline: harvest tokens with the AutoClaw desktop app
+(DevTools → Application → Local Storage → `access_token` / `refresh_token`),
+then import them:
+
+```bash
+# paste directly
+curl -X POST localhost:31000/api/tokens/import \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"you@x","access_token":"...","refresh_token":"...","device_id":"<keep-desktop-device-id>"}'
+# or drop *.json files into .autoclaw_imports/ (ingested at boot)
+```
+
+Formats auto-detected (`autoclaw2api` credential files, raw desktop
+localStorage dumps, `tokens.json` fragments); JWT jti-email extraction,
+expiry checks, desktop `device_id` preservation, dedupe by email or
+refresh_token, encrypted store merge. `/api/login-url` is gated by
+`ACLAW_OAUTH_MODE` (`auto|browser|import|none`).
+
+DSML real-world metrics now surface in `/health` **and** the dashboard:
+parse success rate, call grain by path, the markup-leak taxonomy
+(`truncated_flush` / `oversize_degrade` / `open_tag_timeout` /
+`unparseable_buffered`), shim overhead latency, per-model activations and
+the labelled-approximate tool-loop signal. Metrics **persist across
+restarts** (`data/metrics_state.json`, hourly rollups, 72 h retention) and
+the dashboard gained a DSML panel + hourly history strips.
+
+**Fixed:** streaming latency was TTFB-only (now true stream duration);
+`features.dsml_shim` was never wired; `/health` polluted telemetry; WS
+stream dead peers held threads (keepalive + client cap now); slash-less
+`/dashboard` rendered a blank white page (308 canonicalization).
+
+**Tests: 149 → 180.**
+
 ## 🧩 Phase 3 — WS Fallback, thermoptic Egress, React Dashboard (v2.3.0)
 
 Completes the Priority-3 tier of the AutoClaw Ecosystem Synergy Research

@@ -21,6 +21,15 @@ if _autoclaw_dir not in sys.path:
     sys.path.insert(0, _autoclaw_dir)
 
 from proxy import app  # noqa: E402
+import metrics  # noqa: E402
+
+# Phase-3.1: restore persisted telemetry + start flusher (gunicorn preload
+# path; single-worker guidance in gunicorn_config.py — multi-worker metric
+# aggregation is deferred, research 8-b item 17).
+if metrics.init():
+    import logging
+    logging.getLogger("autoclaw.metrics").info(
+        "Dashboard telemetry restored from metrics_state.json")
 
 if __name__ == "__main__":
     # Development fallback: run with Flask dev server
