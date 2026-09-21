@@ -701,8 +701,10 @@ class TestBridgeRuntime:
 class TestPhase1Regression:
     def test_output_cap_clamping(self):
         from config import clamp_max_output
-        assert clamp_max_output("glm-5.2", 999999) == 131072
-        assert clamp_max_output("cheap", 999999) == 65536
+        # live catalog 2026-09-21: glm-5.2 -> zaicoding_glm-5.3 (307200),
+        # cheap -> zai_auto (32768)
+        assert clamp_max_output("glm-5.2", 999999) == 307200
+        assert clamp_max_output("cheap", 999999) == 32768
         assert clamp_max_output("auto", 999999) == 32768
         assert clamp_max_output("glm-5.2", 1024) == 1024  # never inflate
 
@@ -1118,8 +1120,8 @@ class TestLoopBreaker:
         v_52 = None
         for _ in range(6):
             v_52 = loop_breaker.check("b" * 64, list(msgs), "glm-5.2")
-        assert v_turbo and v_turbo["context_window"] == 65536   # 0.0107 fill counts
-        assert v_52 is None                                     # 0.0053 fill never trips
+        assert v_turbo and v_turbo["context_window"] == 32768   # cheap->zai_auto
+        assert v_52 is None                                     # glm-5.3 307200 never trips
 
     def test_release_clears_streak(self, monkeypatch):
         monkeypatch.setattr(loop_breaker, "_RATIO", 0.01)
@@ -1481,7 +1483,7 @@ class TestPhase2Regression:
     def test_phase1_still_green(self):
         """Synergy 1–5 behaviour unchanged by Phase-2 modules."""
         from config import clamp_max_output
-        assert clamp_max_output("glm-5.2", 999999) == 131072
+        assert clamp_max_output("glm-5.2", 999999) == 307200
         assert clamp_max_output("glm-5.2", 1024) == 1024
         from i18n_errors import translate_error
         assert "Insufficient credits" in translate_error("错误：积分不足")
@@ -1845,13 +1847,13 @@ class TestDashboardRoutes:
         import proxy
         monkeypatch.setattr(proxy, "PROXY_API_KEY", "k1")
         from cache import mark_permanent_failure, is_permanent_failure_cached
-        mark_permanent_failure("zai_glm-5-turbo", "quota_exhausted", "t@x")
-        assert is_permanent_failure_cached("zai_glm-5-turbo", "t@x")
+        mark_permanent_failure("zai_auto", "quota_exhausted", "t@x")
+        assert is_permanent_failure_cached("zai_auto", "t@x")
         r = client.post("/api/dashboard/control",
                         headers={"Authorization": "Bearer k1"},
                         json={"action": "clear_negative_cache"})
         assert r.status_code == 200
-        assert not is_permanent_failure_cached("zai_glm-5-turbo", "t@x")
+        assert not is_permanent_failure_cached("zai_auto", "t@x")
 
     def test_control_reset_metrics(self, client, monkeypatch):
         import proxy
@@ -2803,11 +2805,11 @@ class TestCreditTiers:
 
     def test_alias_resolution(self):
         m, alias = credit_tiers.resolve_claude_alias("claude-opus-4-6")
-        assert alias and m == "openrouter_glm-5.2"
+        assert alias and m == "zaicoding_glm-5.3"
         m, alias = credit_tiers.resolve_claude_alias("claude-sonnet-4-5")
-        assert alias and m == "zai_auto"
+        assert alias and m == "zai_auto-fast"
         m, alias = credit_tiers.resolve_claude_alias("claude-haiku-4")
-        assert alias and m == "zai_glm-5-turbo"
+        assert alias and m == "zai_auto"
 
     def test_non_claude_passthrough(self):
         m, alias = credit_tiers.resolve_claude_alias("glm-5.2")
@@ -3148,7 +3150,7 @@ class TestAnthropicNegativeCache:
         err = r1.get_json()["error"]
         assert err["failure_class"] == "auth_failed"
         # the (model, account) pair is now negatively cached
-        assert is_permanent_failure_cached("zai_glm-5-turbo", "t@x")
+        assert is_permanent_failure_cached("zai_auto", "t@x")
         # second call short-circuits with 429 — never forwarded upstream
         r2 = client.post("/v1/messages", json={
             "model": "glm-5-turbo", "max_tokens": 10,

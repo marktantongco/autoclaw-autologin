@@ -61,18 +61,20 @@ PROXY_API_KEY = os.environ.get("AUTOCLAW_PROXY_API_KEY", None)
 # Key = what client sends as "model" in OpenAI body
 # Value = X-Request-Model header value sent to AutoClaw upstream
 MODEL_MAP = {
-    # Best — real GLM-5.2 (may be unavailable)
-    "glm-5.2": "openrouter_glm-5.2",
-    "glm-5.2-true": "openrouter_glm-5.2",
-    # Cheapest — glm-5-turbo (always available)
-    "glm-5-turbo": "zai_glm-5-turbo",
-    "cheap": "zai_glm-5-turbo",
-    # Avoid — secretly DeepSeek-V4-Pro ~7x cost
+    # Best — GLM-5.3 coding flagship (live catalog 2026-09-21)
+    "glm-5.2": "zaicoding_glm-5.3",
+    "glm-5.2-true": "zaicoding_glm-5.3",
+    "glm": "zaicoding_glm-5.3",
+    # Cheapest live model (zai_glm-5-turbo retired upstream)
+    "glm-5-turbo": "zai_auto",
+    "cheap": "zai_auto",
+    # Genuine upstream Auto router
     "auto": "zai_auto",
-    "deepseek": "zai_auto",
+    # Real DeepSeek entry (live catalog)
+    "deepseek": "tdpsk_deepseek-v4-pro-202606",
 }
 
-DEFAULT_MODEL = "zai_glm-5-turbo"  # Changed from openrouter_glm-5.2 (cheaper, always available)
+DEFAULT_MODEL = "zai_auto"  # cheapest live model (catalog 2026-09-21)
 
 # ── Strict Model Validation ──
 # When true, unknown model names return 400 instead of silent fallback to DEFAULT_MODEL
@@ -148,20 +150,22 @@ OWL_ENABLED_DEFAULT = os.environ.get("OWL_PROXY_ENABLED", "1").strip().lower() n
 # These caps prevent that by clamping max_tokens per-model before the
 # request is forwarded upstream.
 OUTPUT_CAPS = {
-    "openrouter_glm-5.2": 131072,   # GLM-5.2 — exact probe-verified threshold
-    "zai_glm-5-turbo": 65536,        # GLM-5-Turbo — conservative (always available)
-    "zai_auto": 32768,               # DeepSeek-V4-Pro — cap aggressively to
-                                      # prevent billing surprise when "auto" alias
-                                      # is used (it always routes to DeepSeek)
-    "zai_glm-5": 131072,             # GLM-5 — same family as 5.2
-    # v2.6.1 — models discovered in the live model-config payload
-    # (probed 2026-09-21; upstream maxTokens → conservative caps):
+    "openrouter_glm-5.2": 131072,   # GLM-5.2 — retired upstream, entry kept
+                                      # for rollbacks
+    "zai_glm-5-turbo": 65536,        # retired upstream, entry kept
+    "zai_auto": 32768,               # Auto router — cap aggressively to
+                                      # prevent billing surprise when "cheap"
+                                      # alias is used
+    "zai_glm-5": 131072,             # same family as 5.2
+    # v2.6.2 — live catalog (model-config probed 2026-09-21 with a real
+    # token; upstream maxTokens → conservative caps):
     "zaicoding_glm-5.3": 307200,     # GLM-5.3 coding — live maxTokens 307200
     "zai_auto-fast": 131072,         # live maxTokens 393216, capped at the
                                       # GLM probe threshold (DeepSeek-backed
                                       # auto-routing per upstream metadata)
-    "tdpsk_deepseek-v4-pro-202606": 32768,  # explicit DeepSeek variant —
-                                      # same aggressive billing cap as zai_auto
+    "tdpsk_deepseek-v4-pro-202606": 32768,  # explicit DeepSeek entry (live
+                                      # catalog) — aggressive billing cap like
+                                      # zai_auto; upstream maxTokens 393216
     "default": 65536,                 # Unknown model — be safe
 }
 

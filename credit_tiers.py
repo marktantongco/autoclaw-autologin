@@ -34,9 +34,9 @@ TIER_REFRESH_INTERVAL = int(os.environ.get("AUTOCLAW_TIER_REFRESH_S", "300"))  #
 # ─── Static heuristic fallback (used until/unless remote config lands) ──
 
 HEURISTIC_TIERS = {
-    "high": "openrouter_glm-5.2",     # Best quality
-    "medium": "zai_auto",             # Balanced
-    "low": "zai_glm-5-turbo",         # Cheapest, always available
+    "high": "zaicoding_glm-5.3",          # Best quality (live 2026-09-21)
+    "medium": "zai_auto-fast",            # Balanced (live)
+    "low": "zai_auto",                   # Cheapest live model
 }
 
 # Claude alias prefix -> tier

@@ -58,8 +58,11 @@ _WINDOW_OVERRIDE = os.environ.get("AUTOCLAW_CONTEXT_WINDOW", "")
 # aggressively — we protect spend, not benchmark scores. Override globally
 # with AUTOCLAW_CONTEXT_WINDOW when upstream quotas change.
 CONTEXT_WINDOWS = {
-    "openrouter_glm-5.2": 131072,  # GLM-5.2 — matches probe-verified cap
-    "zai_glm-5-turbo": 65536,      # GLM-5-Turbo — conservative
+    "openrouter_glm-5.2": 131072,  # retired upstream, entry kept
+    "zai_glm-5-turbo": 65536,      # retired upstream, entry kept
+    "zaicoding_glm-5.3": 307200,   # live GLM-5.3 (catalog 2026-09-21)
+    "zai_auto": 32768,             # live Auto router — aggressive cap
+    "zai_auto-fast": 131072,       # live Auto-Fast — GLM probe threshold
     "zai_auto": 32768,             # DeepSeek-V4-Pro route — cap hardest
     "zai_glm-5": 131072,
     "default": 65536,
