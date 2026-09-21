@@ -10,7 +10,7 @@ if APP_KEY == "38d2391985e2369a5fb8227d8e6cd5e5":
     import warnings
     warnings.warn("AUTOCLAW_APP_KEY not set — using default (insecure, forgeable). Set env var in production.")
 PRODUCT = "autoclaw"
-VERSION = "2.5.0"
+VERSION = "2.6.2"
 PLATFORM = "win"
 
 # ── Endpoints ──
@@ -43,6 +43,8 @@ TLS_VERIFY = os.environ.get("AUTOCLAW_TLS_VERIFY", "false").lower() == "true"
 # profile; override with AUTOCLAW_UPSTREAM_UA if the app fingerprint moves.
 UPSTREAM_UA = os.environ.get(
     "AUTOCLAW_UPSTREAM_UA",
+    # NOTE: wire fingerprint is pinned to the desktop app build (2.5.0) and is
+    # deliberately decoupled from VERSION — upstream sees one stable client.
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) autoclaw/2.5.0 Chrome/120.0.0.0 Electron/28.0.0 "
     "Safari/537.36",

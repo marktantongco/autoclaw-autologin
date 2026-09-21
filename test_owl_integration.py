@@ -25,6 +25,10 @@ from owl_proxy import (
 import owl_bridge
 from owl_bridge import OwlResponse, OwlStreamResponse, OwlUnavailable
 
+# Proxy's own version (config.VERSION) — distinct from owl_proxy.VERSION (OWL core)
+import config as _config
+PROXY_VERSION = _config.VERSION
+
 # Phase-2 modules (Synergy 8 + 9)
 import chat_fingerprint
 import loop_breaker
@@ -805,7 +809,7 @@ class TestChatRoutes:
         body = r.get_json()
         assert body["status"] == "ok"
         assert "owl" in body and body["owl"]["enabled"] is False
-        assert body["version"] == "2.5.0"
+        assert body["version"] == PROXY_VERSION
 
     def test_router_command_still_intercepted(self, client):
         r = client.post("/v1/chat/completions",
