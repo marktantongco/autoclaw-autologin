@@ -2553,6 +2553,39 @@ class TestDashboardAuth:
         r2 = client.get("/api/dashboard/state")
         assert r2.status_code == 401
 
+    # ── account delete honesty (v2.6.2+) ─────────────────────────────
+
+    def test_delete_last_account_blocked_save_is_honest(self, client, monkeypatch):
+        """save_tokens False (wipe guard on last-account delete / I/O) must
+        NOT surface as {"success": true} — the account would stay on disk
+        while the caller believes it was removed (found via watch-dir E2E:
+        probe purge returned 200 twice, record survived both)."""
+        monkeypatch.setattr(
+            _proxy_mod, "load_tokens",
+            lambda: {"accounts": [{"email": "solo@x", "access_token": "t"}]})
+        monkeypatch.setattr(_proxy_mod, "save_tokens", lambda data: False)
+        r = client.delete("/api/delete/solo@x")
+        assert r.status_code == 500
+        assert "not persisted" in r.get_json()["error"]
+
+    def test_delete_account_success_path_intact(self, client, monkeypatch):
+        saved = {}
+        monkeypatch.setattr(
+            _proxy_mod, "load_tokens",
+            lambda: {"accounts": [{"email": "a@x", "access_token": "t"},
+                                  {"email": "b@x", "access_token": "t"}]})
+        def _save(data):
+            saved["accounts"] = [a["email"] for a in data["accounts"]]
+            return True
+        monkeypatch.setattr(_proxy_mod, "save_tokens", _save)
+        r = client.delete("/api/delete/a@x")
+        assert r.status_code == 200
+        assert r.get_json() == {"success": True, "email": "a@x"}
+        assert saved["accounts"] == ["b@x"]
+        # missing account still 404
+        r2 = client.delete("/api/delete/missing@x")
+        assert r2.status_code == 404
+
     # ── session crypto (D1) ──────────────────────────────────────────
 
     def test_expired_session_rejected(self, client, monkeypatch):

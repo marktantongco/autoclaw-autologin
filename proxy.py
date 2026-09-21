@@ -1452,13 +1452,24 @@ def wallet_bulk():
 
 @app.route("/api/delete/<path:email>", methods=["DELETE"])
 def delete_account(email):
-    """Remove an account from tokens.json."""
+    """Remove an account from tokens.json.
+
+    v2.6.2+: honest about persistence — save_tokens can REFUSE the write
+    (wipe guard blocks removing the last account; I/O errors). A blocked
+    save previously still returned {"success": true}, leaving the account
+    on disk while the caller believed it was gone.
+    """
     data = load_tokens()
     before = len(data["accounts"])
     data["accounts"] = [a for a in data["accounts"] if a.get("email") != email]
     after = len(data["accounts"])
     if after < before:
-        save_tokens(data)
+        if not save_tokens(data):
+            return jsonify({
+                "error": "delete not persisted: save_tokens refused the write "
+                         "(wipe guard blocks removing the last account; "
+                         "edit tokens.json while the daemon is stopped instead)"
+            }), 500
         return jsonify({"success": True, "email": email})
     return jsonify({"error": "Account not found"}), 404
 
