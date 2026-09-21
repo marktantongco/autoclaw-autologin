@@ -54,6 +54,13 @@ from i18n_errors import translate_error
 # racing, single-strike ban, direct fallback). Hybrid backend: external
 # ~/.owl-agent install wins over the vendored owl_proxy.py.
 import owl_bridge
+# v2.6.0 additions — Synergy 6 (Anthropic Messages) + Synergy 7 (credit tiers):
+# Sources: guell11/OmniClaw anthropic.js, eequaled/GLM_proxy fetchRemoteModelConfig
+from anthropic_compat import (
+    anthropic_to_openai, openai_to_anthropic_response,
+    AnthropicStreamConverter, count_tokens_stub,
+)
+import credit_tiers
 
 # Synergy 9 (Phase 2): per-chat fingerprint isolation + loop_breaker.
 # Source: eroslifestyle/ai-router-switch — SHA-256 of the first user message
@@ -418,12 +425,27 @@ def _check_router_command(messages):
     if cmd == "status":
         data = load_tokens()
         n_accounts = len(data.get("accounts", []))
+        tiers = credit_tiers.get_tier_status()
+        tier_lines = "\n".join(
+            f"  {name}: {model}" for name, model in tiers.get("tiers", {}).items()
+        )
         return {"choices": [{"message": {"role": "assistant", "content":
             f"Router Status:\n"
             f"  Active accounts: {n_accounts}\n"
             f"  Default model: {DEFAULT_MODEL}\n"
             f"  Token cache TTL: 5s\n"
-            f"  Encryption: {'enabled' if os.environ.get('AUTOCLAW_TOKEN_KEY') else 'disabled'}"}}],
+            f"  Encryption: {'enabled' if os.environ.get('AUTOCLAW_TOKEN_KEY') else 'disabled'}\n"
+            f"  Credit tiers (source: {tiers.get('source')})\n{tier_lines}"}}],
+            "usage": {}}, True
+    elif cmd == "tiers":
+        # v2.6.0 (Synergy 7): force credit-tier refresh on demand
+        credit_tiers.force_refresh()
+        tiers = credit_tiers.get_tier_status()
+        tier_lines = "\n".join(
+            f"  {name}: {model}" for name, model in tiers.get("tiers", {}).items()
+        )
+        return {"choices": [{"message": {"role": "assistant", "content":
+            f"Credit tiers refreshed (source: {tiers.get('source')})\n{tier_lines}"}}],
             "usage": {}}, True
     elif cmd == "reset":
         global _token_idx
@@ -448,6 +470,7 @@ def _check_router_command(messages):
             "  !router status\n"
             "  !router reset\n"
             "  !router refresh-all\n"
+            "  !router tiers\n"
             "  !router help"}}], "usage": {}}, True
     return None, False
 
@@ -477,7 +500,16 @@ def chat_completions():
     g._model = body.get("model", DEFAULT_MODEL)  # Phase 3: metrics tag
     # Model mapping with strict validation (Audit Fix: silent fallback to expensive model)
     client_model = body.get("model", DEFAULT_MODEL)
-    upstream_model = MODEL_MAP.get(client_model)
+    # ── v2.6.0 Synergy 7: Claude credit-tier routing ──
+    # Source: eequaled/GLM_proxy fetchRemoteModelConfig / resolveTierTargets
+    # claude-opus-* -> High, claude-sonnet-* -> Medium, claude-haiku-* -> Low.
+    tier_model, is_claude_alias = credit_tiers.resolve_claude_alias(client_model)
+    if is_claude_alias:
+        logger.info(f"Claude alias routed: {client_model} -> {tier_model}")
+        client_model = client_model  # preserve client-facing name for response
+        upstream_model = tier_model
+    else:
+        upstream_model = MODEL_MAP.get(client_model)
     if upstream_model is None:
         if STRICT_MODEL_VALIDATION:
             return jsonify({"error": {
@@ -997,7 +1029,230 @@ def list_models():
             "owned_by": "autoclaw",
             "upstream": upstream,
         })
+    # v2.6.0 (Synergy 7): expose Claude aliases (credit-tier routed)
+    for alias in ("claude-opus-latest", "claude-sonnet-latest", "claude-haiku-latest"):
+        models.append({
+            "id": alias,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "autoclaw-credit-tier",
+        })
     return jsonify({"object": "list", "data": models})
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# v2.6.0 — Synergy 6: Anthropic Messages endpoint
+# Source: guell11/OmniClaw anthropic.js + eequaled/GLM_proxy anthropic.js
+# Lets Claude Code / OpenCode / Anthropic-SDK clients use AutoClaw natively.
+# Metrics are recorded automatically by the after_request hook (route
+# starts with /v1/); g._model / g._wants_stream are set for correct tags.
+# ──────────────────────────────────────────────────────────────────────────
+
+@app.route("/v1/messages", methods=["POST"])
+def anthropic_messages():
+    """Anthropic Messages API compatibility endpoint.
+
+    Converts the Anthropic request to OpenAI chat format internally,
+    reuses the same upstream/token/security pipeline as
+    /v1/chat/completions, and converts the response back to Anthropic
+    shape (non-stream JSON or full Anthropic SSE event sequence).
+    """
+    # Same API-key gate as the OpenAI endpoint (plus Anthropic x-api-key)
+    if PROXY_API_KEY:
+        auth = request.headers.get("Authorization", "")
+        xkey = request.headers.get("x-api-key", "")
+        if auth != f"Bearer {PROXY_API_KEY}" and xkey != PROXY_API_KEY:
+            return jsonify({
+                "type": "error",
+                "error": {"type": "authentication_error",
+                          "message": "Invalid or missing API key"},
+            }), 401
+
+    body = request.get_json(force=True)
+    if not body:
+        return jsonify({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "Invalid JSON body"},
+        }), 400
+
+    client_model = body.get("model", DEFAULT_MODEL)
+    g._model = client_model  # metrics tag
+    g._wants_stream = bool(body.get("stream", False))
+
+    # Credit-tier routing also applies to Anthropic clients (Synergy 7)
+    tier_model, is_claude_alias = credit_tiers.resolve_claude_alias(client_model)
+    if is_claude_alias:
+        logger.info(f"Claude alias routed: {client_model} -> {tier_model}")
+        upstream_model = tier_model
+    else:
+        upstream_model = MODEL_MAP.get(client_model)
+    if upstream_model is None:
+        if STRICT_MODEL_VALIDATION:
+            return jsonify({
+                "type": "error",
+                "error": {"type": "invalid_request_error",
+                          "message": f"Unknown model '{client_model}'. Available: {list(MODEL_MAP.keys())} + claude-* aliases"},
+            }), 400
+        upstream_model = DEFAULT_MODEL
+
+    # Anthropic -> OpenAI conversion
+    openai_body = anthropic_to_openai(body)
+    openai_body["model"] = "x"
+    openai_body["stream"] = True  # upstream always streams (DeepSeek 500s otherwise)
+
+    # System banner (same upstream gate as the OpenAI path)
+    if isinstance(openai_body.get("messages"), list):
+        openai_body["messages"] = list(openai_body["messages"])
+        _inject_system_banner(openai_body["messages"])
+
+    # Output-cap clamping (Synergy 1) — prevents silent DeepSeek substitution
+    if openai_body.get("max_tokens") is not None:
+        openai_body["max_tokens"] = clamp_max_output(client_model, openai_body["max_tokens"])
+
+    # Token + permanent-failure cache (Synergy 3)
+    access_token, acc = get_next_token()
+    if not access_token:
+        return jsonify({
+            "type": "error",
+            "error": {"type": "authentication_error",
+                      "message": "No valid tokens. Add accounts first via /login or /api/tokens/import."},
+        }), 401
+    used_email = acc.get("email", "unknown")
+    if is_permanent_failure_cached(upstream_model, used_email):
+        g._metrics_block = "negative_cache"
+        return jsonify({
+            "type": "error",
+            "error": {"type": "rate_limit_error",
+                      "message": "Account temporarily unavailable (cached permanent failure)."},
+        }), 429
+
+    headers = _sign_headers()
+    headers["X-Authorization"] = f"Bearer {access_token.replace('Bearer ', '')}"
+    headers["X-Request-Model"] = upstream_model
+    headers["X-Request-Id"] = str(uuid.uuid4())
+
+    try:
+        upstream_resp = req_lib.post(
+            CHAT_COMPLETIONS, json=openai_body, headers=headers,
+            stream=True, timeout=600, verify=False,
+        )
+        if upstream_resp.status_code != 200:
+            translated = translate_error(upstream_resp.text[:1000])
+            return jsonify({
+                "type": "error",
+                "error": {"type": "api_error",
+                          "message": f"Upstream error {upstream_resp.status_code}: {translated}"},
+            }), upstream_resp.status_code
+
+        if body.get("stream", False):
+            # Anthropic SSE event sequence (message_start -> ... -> message_stop)
+            converter = AnthropicStreamConverter(client_model)
+
+            def anthropic_generate():
+                for line in upstream_resp.iter_lines():
+                    if not line:
+                        continue
+                    line_str = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
+                    if not line_str.startswith("data: "):
+                        continue
+                    data_str = line_str[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        for event in converter.process_chunk(chunk):
+                            yield event
+                    except json.JSONDecodeError:
+                        continue
+                for event in converter.flush_trailers():
+                    yield event
+            return Response(
+                anthropic_generate(),
+                mimetype="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # Non-stream: aggregate upstream SSE -> OpenAI -> Anthropic JSON
+        full_content = ""
+        full_tool_calls = []
+        usage = {}
+        for line in upstream_resp.iter_lines():
+            if not line:
+                continue
+            line_str = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
+            if not line_str.startswith("data: "):
+                continue
+            data_str = line_str[6:]
+            if data_str.strip() == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+                choices = chunk.get("choices", [])
+                if choices:
+                    delta = choices[0].get("delta", {})
+                    if delta.get("content"):
+                        full_content += delta["content"]
+                    for tc in delta.get("tool_calls", []) or []:
+                        idx = tc.get("index", 0)
+                        while len(full_tool_calls) <= idx:
+                            full_tool_calls.append({"id": "", "type": "function",
+                                                    "function": {"name": "", "arguments": ""}})
+                        if tc.get("id"):
+                            full_tool_calls[idx]["id"] = tc["id"]
+                        fn = tc.get("function", {})
+                        if fn.get("name"):
+                            full_tool_calls[idx]["function"]["name"] += fn["name"]
+                        if fn.get("arguments"):
+                            full_tool_calls[idx]["function"]["arguments"] += fn["arguments"]
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+            except json.JSONDecodeError:
+                continue
+
+        openai_resp = {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": full_content if full_content else None,
+                    **({"tool_calls": full_tool_calls} if full_tool_calls else {}),
+                },
+                "finish_reason": "tool_calls" if full_tool_calls else "stop",
+            }],
+            "usage": usage,
+        }
+        anthropic_resp = openai_to_anthropic_response(openai_resp, client_model)
+        return jsonify(anthropic_resp)
+
+    except req_lib.exceptions.Timeout:
+        return jsonify({
+            "type": "error",
+            "error": {"type": "timeout_error", "message": "Upstream timeout"},
+        }), 504
+    except Exception as e:
+        return jsonify({
+            "type": "error",
+            "error": {"type": "api_error", "message": f"Proxy error: {str(e)}"},
+        }), 500
+
+
+@app.route("/v1/messages/count_tokens", methods=["POST"])
+def anthropic_count_tokens():
+    """Stub token counter (Anthropic wire compatibility).
+
+    Synergy: OmniClaw / GLM_proxy both stub this endpoint — the upstream
+    has no equivalent API. Uses a ~4 chars/token heuristic.
+    """
+    if PROXY_API_KEY:
+        auth = request.headers.get("Authorization", "")
+        xkey = request.headers.get("x-api-key", "")
+        if auth != f"Bearer {PROXY_API_KEY}" and xkey != PROXY_API_KEY:
+            return jsonify({
+                "type": "error",
+                "error": {"type": "authentication_error",
+                          "message": "Invalid or missing API key"},
+            }), 401
+    body = request.get_json(force=True) or {}
+    return jsonify(count_tokens_stub(body))
 
 
 @app.route("/health", methods=["GET"])

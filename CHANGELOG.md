@@ -1,5 +1,63 @@
 # Changelog
 
+## v2.6.0 — Anthropic Messages Endpoint + Claude Credit-Tier Routing (2026-09-21)
+
+**Scope:** the two remaining research-synergy gaps from the 9-repo
+ecosystem deep-dive (`AutoClaw-Synergy-Research-Deep-Dive.pdf`, synergies
+6 + 7 of the Phase-2 roadmap) — the pieces v2.2-v2.5 did not cover. Both
+are additive; no existing surface changed.
+
+### Added
+
+- **Anthropic Messages endpoint (Synergy 6)** — new `anthropic_compat.py`
+  translates Anthropic `/v1/messages` wire format to the internal OpenAI
+  chat pipeline and back, so Claude Code, OpenCode, and any
+  Anthropic-SDK client can use AutoClaw natively (no adapter):
+  - `POST /v1/messages` — stream + non-stream. Streaming emits the full
+    Anthropic SSE sequence (`message_start`, `content_block_start`,
+    `content_block_delta` text/input_json_delta, `content_block_stop`,
+    `message_delta` with stop_reason, `message_stop`), including
+    streamed `tool_use` blocks from OpenAI `tool_calls` deltas.
+  - Request conversion covers system (string + block list), text
+    blocks, base64 image blocks -> `image_url` data-URLs,
+    `tool_use` -> `tool_calls`, `tool_result` -> standalone `tool`
+    role messages, `thinking` blocks skipped (OmniClaw parity).
+  - Response conversion maps finish_reason -> stop_reason
+    (stop/length/tool_calls -> end_turn/max_tokens/tool_use) and
+    usage -> input/output tokens.
+  - `POST /v1/messages/count_tokens` — stub with a ~4 chars/token
+    heuristic (both upstream proxies stub this endpoint too).
+  - Reuses the full security pipeline: API-key gate (Bearer OR
+    `x-api-key`), system-banner injection, output-cap clamping,
+    permanent-failure negative cache (`negative_cache` metrics block),
+    structured logging; metrics recorded by the existing after_request
+    hook (g._model / g._wants_stream set for correct tags).
+- **Claude credit-tier routing (Synergy 7)** — new `credit_tiers.py`:
+  `claude-opus-*` -> High tier (`openrouter_glm-5.2`),
+  `claude-sonnet-*` -> Medium (`zai_auto`), `claude-haiku-*` -> Low
+  (`zai_glm-5-turbo`).
+  - Tier targets refresh in the background from the remote
+    model-config endpoint (5 min interval, heuristic degradation on
+    failure — the service never blocks on the refresh).
+  - Wired into both `/v1/chat/completions` and `/v1/messages` model
+    resolution (before MODEL_MAP lookup; strict validation still
+    rejects truly unknown non-Claude models).
+  - `/v1/models` now advertises `claude-opus-latest`,
+    `claude-sonnet-latest`, `claude-haiku-latest`.
+  - `!router tiers` forces a synchronous refresh; `!router status`
+    shows the tier table + source.
+- **21 new tests** (converter coverage, stream event sequence, tool_use
+  streaming, count_tokens, endpoint error shapes, alias routing,
+  tier extraction, `!router tiers`) — suite now **219/219**.
+
+### Notes
+
+- The credit-tier refresh thread starts at proxy import (daemon,
+  idempotent — safe under Gunicorn preload). In offline/test
+  environments it degrades to the heuristic table silently.
+- Env knobs: `AUTOCLAW_MODEL_CONFIG_URL`, `AUTOCLAW_TIER_REFRESH_S`
+  (see `deploy/env.template`).
+
 ## v2.5.0 — Dashboard Auth Surface (SPEC-8b7) (2026-09-20)
 
 **Scope:** the top remaining 8-b backlog item — the dashboard/telemetry
