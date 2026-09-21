@@ -1,0 +1,157 @@
+{
+  "generator": "scripts/gen_skills_lock.py (vendored kernel; scheme: SHA-256 over sorted relpath\\0content\\0)",
+  "hashScheme": "sorted(relpath + NUL + filebytes + NUL) -> sha256",
+  "skills": {
+    "agent-browser": {
+      "computedHash": "80161e6836b3b40f4e83730a290deb40ac14d877d38c97ad5f6d71be37ce74c3",
+      "files": 1,
+      "modifications": "none",
+      "ref": "44583ac8385d814ab98cbf40feec97620376b50e",
+      "skillPath": "skills/agent-browser",
+      "source": "vercel-labs/agent-browser",
+      "sourceUrl": "https://github.com/vercel-labs/agent-browser",
+      "vendoredPath": ".agents/skills/agent-browser"
+    },
+    "brainstorming": {
+      "computedHash": "a70fba9bbe817b48ee9211cafaf2bfea2cf253d2d87fc51b75ffd4d0cca3be7a",
+      "files": 8,
+      "modifications": "none",
+      "ref": "5bf4e78011075bcfc0dc295f0724994cd123ee71",
+      "skillPath": "skills/brainstorming",
+      "source": "obra/superpowers",
+      "sourceUrl": "https://github.com/obra/superpowers",
+      "vendoredPath": ".agents/skills/brainstorming"
+    },
+    "dispatching-parallel-agents": {
+      "computedHash": "1acb899b23c2bdb5af5961e7b97ba43fb2a5593822db755747ef3d5db9f825a4",
+      "files": 1,
+      "modifications": "none",
+      "ref": "5bf4e78011075bcfc0dc295f0724994cd123ee71",
+      "skillPath": "skills/dispatching-parallel-agents",
+      "source": "obra/superpowers",
+      "sourceUrl": "https://github.com/obra/superpowers",
+      "vendoredPath": ".agents/skills/dispatching-parallel-agents"
+    },
+    "executing-plans": {
+      "computedHash": "6929a96d5c1a22522a43284c98e246c62dff3dea044cd766c1535b8500770a1d",
+      "files": 3,
+      "modifications": "none",
+      "ref": "5bf4e78011075bcfc0dc295f0724994cd123ee71",
+      "skillPath": "skills/executing-plans",
+      "source": "obra/superpowers",
+      "sourceUrl": "https://github.com/obra/superpowers",
+      "vendoredPath": ".agents/skills/executing-plans"
+    },
+    "find-skills": {
+      "computedHash": "b146008599c31057cef1c145774cea5d5afb30e8f43fa802e47a4b461419aaaf",
+      "files": 1,
+      "modifications": "none",
+      "ref": "7407f3893ad4dceab546ac002c3ef806e4000c73",
+      "skillPath": "skills/find-skills",
+      "source": "vercel-labs/skills",
+      "sourceUrl": "https://github.com/vercel-labs/skills",
+      "vendoredPath": ".agents/skills/find-skills"
+    },
+    "finishing-a-development-branch": {
+      "computedHash": "1da9182001d887c0fb8c62aeee35c8f65b438b32a30b79104baedcca9e0ebef6",
+      "files": 1,
+      "modifications": "none",
+      "ref": "5bf4e78011075bcfc0dc295f0724994cd123ee71",
+      "skillPath": "skills/finishing-a-development-branch",
+      "source": "obra/superpowers",
+      "sourceUrl": "https://github.com/obra/superpowers",
+      "vendoredPath": ".agents/skills/finishing-a-development-branch"
+    },
+    "grill-me": {
+      "computedHash": "14c292fe16c0aed833cbbabb0983515c8d665fb6061d9755b13dba870363323b",
+      "files": 2,
+      "modifications": "none",
+      "ref": "c55ee46073ed923f86ce59a5eb3b6d895095d1b7",
+      "skillPath": "skills/productivity/grill-me",
+      "source": "mattpocock/skills",
+      "sourceUrl": "https://github.com/mattpocock/skills",
+      "vendoredPath": ".agents/skills/grill-me"
+    },
+    "grilling": {
+      "computedHash": "d5833e50e0081bbf5133b6c6b61aa8ba9ffae66e9071404b61e45b18f4cdb57e",
+      "files": 2,
+      "modifications": "none",
+      "ref": "c55ee46073ed923f86ce59a5eb3b6d895095d1b7",
+      "skillPath": "skills/productivity/grilling",
+      "source": "mattpocock/skills",
+      "sourceUrl": "https://github.com/mattpocock/skills",
+      "vendoredPath": ".agents/skills/grilling"
+    },
+    "headroom": {
+      "computedHash": "924d80687d6e0352a68487cfeea9eef940e86a473f6d032a9e852aca13f88f3f",
+      "files": 2,
+      "modifications": "none",
+      "ref": "118466d7737ebc42806c331e44bd251b5222d59b",
+      "skillPath": ".",
+      "source": "roman-ryzenadvanced/headroom-skill",
+      "sourceUrl": "https://github.com/roman-ryzenadvanced/headroom-skill",
+      "vendoredPath": ".agents/skills/headroom"
+    },
+    "impeccable": {
+      "computedHash": "31942ef550dbab01318815f84d0f473d3422e714e0c1c7b645f2eef7140abaad",
+      "files": 52,
+      "modifications": "SKILL.src.md renamed to SKILL.md; template placeholders concretized (scripts_path -> npx impeccable)",
+      "ref": "f2c7051853848826aac2f4646581d62a732155ad",
+      "skillPath": "skill",
+      "source": "pbakaus/impeccable",
+      "sourceUrl": "https://github.com/pbakaus/impeccable",
+      "vendoredPath": ".agents/skills/impeccable"
+    },
+    "subagent-driven-development": {
+      "computedHash": "82c02535618f6b0c5ef3c377e588873b0ec2a7b6c03a0029210721b30d2cc48d",
+      "files": 7,
+      "modifications": "none",
+      "ref": "5bf4e78011075bcfc0dc295f0724994cd123ee71",
+      "skillPath": "skills/subagent-driven-development",
+      "source": "obra/superpowers",
+      "sourceUrl": "https://github.com/obra/superpowers",
+      "vendoredPath": ".agents/skills/subagent-driven-development"
+    },
+    "systematic-debugging": {
+      "computedHash": "37fd06e80f296251caf4eb3554ab8771d7cf14ba382efcf812d8f3247d64dcbe",
+      "files": 11,
+      "modifications": "none",
+      "ref": "5bf4e78011075bcfc0dc295f0724994cd123ee71",
+      "skillPath": "skills/systematic-debugging",
+      "source": "obra/superpowers",
+      "sourceUrl": "https://github.com/obra/superpowers",
+      "vendoredPath": ".agents/skills/systematic-debugging"
+    },
+    "using-superpowers": {
+      "computedHash": "bcdbc241f63b69c68e66b9168012dc703ef955ac381a955a72aa2c0f256495bc",
+      "files": 8,
+      "modifications": "none",
+      "ref": "5bf4e78011075bcfc0dc295f0724994cd123ee71",
+      "skillPath": "skills/using-superpowers",
+      "source": "obra/superpowers",
+      "sourceUrl": "https://github.com/obra/superpowers",
+      "vendoredPath": ".agents/skills/using-superpowers"
+    },
+    "verification-before-completion": {
+      "computedHash": "d8a53168f152b6163bd3447f7d4c20b6b4cddf6bd907f9aa5856b514c032db0e",
+      "files": 1,
+      "modifications": "none",
+      "ref": "5bf4e78011075bcfc0dc295f0724994cd123ee71",
+      "skillPath": "skills/verification-before-completion",
+      "source": "obra/superpowers",
+      "sourceUrl": "https://github.com/obra/superpowers",
+      "vendoredPath": ".agents/skills/verification-before-completion"
+    },
+    "writing-plans": {
+      "computedHash": "1f64e484138498223db90792b30133ab2416b87d75acf5390f6f37ca2a8799e8",
+      "files": 2,
+      "modifications": "none",
+      "ref": "5bf4e78011075bcfc0dc295f0724994cd123ee71",
+      "skillPath": "skills/writing-plans",
+      "source": "obra/superpowers",
+      "sourceUrl": "https://github.com/obra/superpowers",
+      "vendoredPath": ".agents/skills/writing-plans"
+    }
+  },
+  "version": 1
+}
