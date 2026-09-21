@@ -14,3 +14,4 @@ proxies.txt
 node_modules/
 data/metrics_state.json
 proxy.pid
+.autoclaw_imports/
