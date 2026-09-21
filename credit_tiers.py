@@ -110,7 +110,9 @@ class CreditTierResolver:
         """Fetch remote model-config; update tiers; degrade gracefully."""
         try:
             import requests
-            resp = requests.get(MODEL_CONFIG_URL, timeout=10, verify=False)
+            from config import UPSTREAM_UA
+            resp = requests.get(MODEL_CONFIG_URL, timeout=10, verify=False,
+                                headers={"User-Agent": UPSTREAM_UA})
             if resp.status_code != 200:
                 raise RuntimeError(f"HTTP {resp.status_code}")
             data = resp.json()
@@ -131,11 +133,36 @@ class CreditTierResolver:
             logger.debug(f"Credit-tier refresh degraded to heuristic: {e}")
 
     @staticmethod
-    def _extract_tiers(data) -> dict:
+    def _normalize_level(val) -> str:
+        """Normalize a creditConsumptionLevel value to high|medium|low|''.
+
+        Live-verified upstream vocabulary (probed 2026-09-21): "Low",
+        "High", "中" (Medium). Defensive: also accept 高/低, full-width,
+        any case, and surrounding whitespace.
+        """
+        if not isinstance(val, str):
+            return ""
+        v = val.strip().lower()
+        if v in ("low", "低"):
+            return "low"
+        if v in ("high", "高"):
+            return "high"
+        if v in ("medium", "med", "mid", "中", "中等"):
+            return "medium"
+        return ""
+
+    @classmethod
+    def _extract_tiers(cls, data) -> dict:
         """Extract {high, medium, low} model names from remote config.
 
         The remote config shape is not strictly guaranteed; try common
         layouts and fall back to empty (heuristic continues to serve).
+
+        Layout 2 (live-verified 2026-09-21): {"models": [{"id",
+        "creditConsumptionLevel": "Low"|"High"|"中", ...}]}. The
+        original implementation read m['credits']/m['tier'] — fields the
+        real payload does not carry — so remote extraction silently
+        degraded to heuristic forever. Fixed to read the real field.
         """
         tiers = {}
         if not isinstance(data, dict):
@@ -153,7 +180,9 @@ class CreditTierResolver:
                     elif isinstance(val, dict) and val.get("model"):
                         tiers[tier] = val["model"]
 
-        # Layout 2: model list with credit annotations
+        # Layout 2: model list with credit annotations.
+        # Primary signal: creditConsumptionLevel (live-verified field).
+        # Fallback signals: credits / tier fields, then name heuristics.
         models = data.get("models") or (candidate.get("models") if isinstance(candidate, dict) else None)
         if isinstance(models, list) and not tiers:
             high_picks, med_picks, low_picks = [], [], []
@@ -161,13 +190,23 @@ class CreditTierResolver:
                 if not isinstance(m, dict):
                     continue
                 mid = m.get("id") or m.get("model") or ""
-                credits = m.get("credits") or m.get("tier") or ""
                 if not mid:
                     continue
-                cl = str(credits).lower()
-                if "high" in cl or "opus" in mid.lower():
+                level = cls._normalize_level(m.get("creditConsumptionLevel"))
+                if not level:
+                    level = cls._normalize_level(m.get("credits") or m.get("tier"))
+                if not level:
+                    # Legacy name-based classification (pre-config payloads)
+                    ml = mid.lower()
+                    if "opus" in ml:
+                        level = "high"
+                    elif "turbo" in ml or "haiku" in ml:
+                        level = "low"
+                    else:
+                        level = "medium"
+                if level == "high":
                     high_picks.append(mid)
-                elif "low" in cl or "turbo" in mid.lower():
+                elif level == "low":
                     low_picks.append(mid)
                 else:
                     med_picks.append(mid)

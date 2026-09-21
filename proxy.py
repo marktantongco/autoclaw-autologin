@@ -310,6 +310,7 @@ def _bg_wallet_checker():
 def _sign_headers():
     import hashlib
     from config import APP_ID, APP_KEY, PRODUCT, VERSION, PLATFORM
+    from config import UPSTREAM_UA  # v2.6.1: WAF blocks python-requests UA
     ts = str(int(time.time()))
     sign = hashlib.md5(f"{APP_ID}&{ts}&{APP_KEY}".encode()).hexdigest()
     return {
@@ -321,7 +322,102 @@ def _sign_headers():
         "X-Tm": PLATFORM,
         "X-Trace-Id": str(uuid.uuid4()),
         "Content-Type": "application/json",
+        "User-Agent": UPSTREAM_UA,
     }
+
+
+def _egress_chat_post(headers, upstream_body):
+    """Tiered egress chain (Synergies 6 × 13 × 14) — shared by the OpenAI
+    (/v1/chat/completions) and Anthropic (/v1/messages) upstream POSTs.
+
+    Tier order comes from the dashboard control surface:
+      owl-first (default)  owl → thermoptic → direct
+      thermoptic-first     thermoptic → owl → direct
+      direct-only          direct
+    Every tier failure falls to the next; WS local-agent fallback (#13)
+    engages ONLY after a NETWORK-level fault (connection refused / DNS /
+    connect timeout). HTTP error statuses are upstream decisions and are
+    returned to the caller for verbatim relay to the client.
+
+    v2.6.1: extracted from chat_completions so /v1/messages routes through
+    the SAME chain (it previously hard-coded direct req_lib.post — the WAF
+    405 finding showed every egress change must cover both endpoints).
+
+    Returns (upstream_resp | None, via | None, last_net_exc | None).
+    """
+    pref = metrics.backend_pref()
+    tiers = []
+    if pref == "direct-only":
+        tiers.append("direct")
+    elif pref == "thermoptic-first":
+        if thermoptic_bridge.healthy():
+            tiers.append("thermoptic")
+        if owl_bridge.owl_enabled():
+            tiers.append("owl")
+        tiers.append("direct")
+    else:  # owl-first (default)
+        if owl_bridge.owl_enabled():
+            tiers.append("owl")
+        if thermoptic_bridge.healthy():
+            tiers.append("thermoptic")
+        tiers.append("direct")
+
+    upstream_resp = None
+    via = None
+    last_net_exc = None
+    for tier in tiers:
+        try:
+            if tier == "owl":
+                upstream_resp = owl_bridge.owl_stream_request(
+                    "POST", CHAT_COMPLETIONS,
+                    headers=headers, json_body=upstream_body, timeout=600,
+                )
+                via = f"owl-proxy/{owl_bridge.owl_backend()}"
+            elif tier == "thermoptic":
+                upstream_resp = thermoptic_bridge.http_request(
+                    "POST", CHAT_COMPLETIONS,
+                    headers=headers, json_body=upstream_body,
+                    stream=True, timeout=600,
+                )
+                via = "thermoptic"
+                g._metrics_feature = "thermoptic"
+            else:
+                # Always request stream from upstream (direct path)
+                upstream_resp = req_lib.post(
+                    CHAT_COMPLETIONS,
+                    json=upstream_body,
+                    headers=headers,
+                    stream=True,
+                    timeout=600,
+                    verify=False,
+                )
+                via = "direct"
+            break
+        except owl_bridge.OwlUnavailable as e:
+            logger.warning(f"[{tier}] unavailable → next tier: {e}")
+        except thermoptic_bridge.ThermopticUnavailable as e:
+            logger.warning(f"[{tier}] unavailable → next tier: {e}")
+        except (req_lib.exceptions.ConnectionError,
+                req_lib.exceptions.Timeout) as e:
+            last_net_exc = e
+            logger.warning(
+                f"[{tier}] network fault → next tier: "
+                f"{type(e).__name__}: {e}")
+
+    # ── Synergy 13: cloud-to-local WS fallback (last resort) ──
+    if (upstream_resp is None and ws_fallback.enabled()
+            and last_net_exc is not None):
+        try:
+            upstream_resp = ws_fallback.chat_stream(
+                upstream_body, timeout=600)
+            via = "ws-local-agent"
+            g._metrics_feature = "ws_fallback"
+            logger.info("Chat upstream via ws-local-agent "
+                        "(cloud unreachable)")
+        except ws_fallback.WsUnavailable as e:
+            logger.warning(f"ws-local-agent unavailable: {e}")
+
+    return upstream_resp, via, last_net_exc
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -669,85 +765,9 @@ def chat_completions():
 
     try:
         # ── Phase 3: tiered egress chain (Synergies 6 × 13 × 14) ──
-        # Tier order comes from the dashboard control surface:
-        #   owl-first (default)  owl → thermoptic → direct
-        #   thermoptic-first     thermoptic → owl → direct
-        #   direct-only          direct
-        # Every tier failure falls to the next; WS local-agent fallback
-        # (#13) engages ONLY after a NETWORK-level fault (connection
-        # refused / DNS / connect timeout). HTTP error statuses are
-        # upstream decisions and return to the client verbatim.
-        pref = metrics.backend_pref()
-        tiers = []
-        if pref == "direct-only":
-            tiers.append("direct")
-        elif pref == "thermoptic-first":
-            if thermoptic_bridge.healthy():
-                tiers.append("thermoptic")
-            if owl_bridge.owl_enabled():
-                tiers.append("owl")
-            tiers.append("direct")
-        else:  # owl-first (default)
-            if owl_bridge.owl_enabled():
-                tiers.append("owl")
-            if thermoptic_bridge.healthy():
-                tiers.append("thermoptic")
-            tiers.append("direct")
-
-        upstream_resp = None
-        via = None
-        last_net_exc = None
-        for tier in tiers:
-            try:
-                if tier == "owl":
-                    upstream_resp = owl_bridge.owl_stream_request(
-                        "POST", CHAT_COMPLETIONS,
-                        headers=headers, json_body=upstream_body, timeout=600,
-                    )
-                    via = f"owl-proxy/{owl_bridge.owl_backend()}"
-                elif tier == "thermoptic":
-                    upstream_resp = thermoptic_bridge.http_request(
-                        "POST", CHAT_COMPLETIONS,
-                        headers=headers, json_body=upstream_body,
-                        stream=True, timeout=600,
-                    )
-                    via = "thermoptic"
-                    g._metrics_feature = "thermoptic"
-                else:
-                    # Always request stream from upstream (direct path)
-                    upstream_resp = req_lib.post(
-                        CHAT_COMPLETIONS,
-                        json=upstream_body,
-                        headers=headers,
-                        stream=True,
-                        timeout=600,
-                        verify=False,
-                    )
-                    via = "direct"
-                break
-            except owl_bridge.OwlUnavailable as e:
-                logger.warning(f"[{tier}] unavailable → next tier: {e}")
-            except thermoptic_bridge.ThermopticUnavailable as e:
-                logger.warning(f"[{tier}] unavailable → next tier: {e}")
-            except (req_lib.exceptions.ConnectionError,
-                    req_lib.exceptions.Timeout) as e:
-                last_net_exc = e
-                logger.warning(
-                    f"[{tier}] network fault → next tier: "
-                    f"{type(e).__name__}: {e}")
-
-        # ── Synergy 13: cloud-to-local WS fallback (last resort) ──
-        if (upstream_resp is None and ws_fallback.enabled()
-                and last_net_exc is not None):
-            try:
-                upstream_resp = ws_fallback.chat_stream(
-                    upstream_body, timeout=600)
-                via = "ws-local-agent"
-                g._metrics_feature = "ws_fallback"
-                logger.info("Chat upstream via ws-local-agent "
-                            "(cloud unreachable)")
-            except ws_fallback.WsUnavailable as e:
-                logger.warning(f"ws-local-agent unavailable: {e}")
+        # v2.6.1: shared helper — /v1/messages uses the identical chain.
+        upstream_resp, via, last_net_exc = _egress_chat_post(
+            headers, upstream_body)
 
         if upstream_resp is None:
             g._upstream_via = "none"
@@ -1132,16 +1152,54 @@ def anthropic_messages():
     headers["X-Request-Id"] = str(uuid.uuid4())
 
     try:
-        upstream_resp = req_lib.post(
-            CHAT_COMPLETIONS, json=openai_body, headers=headers,
-            stream=True, timeout=600, verify=False,
-        )
-        if upstream_resp.status_code != 200:
-            translated = translate_error(upstream_resp.text[:1000])
+        # v2.6.1: same tiered egress chain as /v1/chat/completions
+        # (owl → thermoptic → direct → ws-local-agent on network faults)
+        upstream_resp, via, last_net_exc = _egress_chat_post(
+            headers, openai_body)
+        if upstream_resp is None:
+            g._upstream_via = "none"
+            detail = (f"{type(last_net_exc).__name__}: {last_net_exc}"
+                      if last_net_exc else "no transport available")
             return jsonify({
                 "type": "error",
                 "error": {"type": "api_error",
-                          "message": f"Upstream error {upstream_resp.status_code}: {translated}"},
+                          "message": f"Upstream unreachable ({detail})"},
+            }), 502
+        g._upstream_via = via
+        logger.info(f"Anthropic upstream via {via}")
+
+        if upstream_resp.status_code != 200:
+            if isinstance(upstream_resp, (owl_bridge.OwlStreamResponse,
+                                          ws_fallback.WsStreamResponse)):
+                raw_error = upstream_resp.read_error(1000)
+            else:
+                raw_error = upstream_resp.text[:1000]
+            translated = translate_error(raw_error)
+            # ── Synergy 3: classify + mark permanent failures (v2.6.1) ──
+            # The OpenAI endpoint marks the negative cache on doomed
+            # responses; the Anthropic endpoint skipped this — live smoke
+            # test caught doomed requests replaying the edge every call.
+            failure_class = None
+            lower_translated = translated.lower()
+            if upstream_resp.status_code in (401, 403) or "auth" in lower_translated:
+                failure_class = "auth_failed"
+            elif upstream_resp.status_code == 404 or "model not found" in lower_translated:
+                failure_class = "model_not_found"
+            elif upstream_resp.status_code == 402 or "insufficient credits" in lower_translated or "quota exhausted" in lower_translated:
+                failure_class = "quota_exhausted"
+            elif "banned" in lower_translated:
+                failure_class = "account_banned"
+            if failure_class:
+                mark_permanent_failure(upstream_model, failure_class, used_email)
+                logger.warning(
+                    f"Marked permanent failure (anthropic): model={upstream_model} "
+                    f"account={used_email} class={failure_class}"
+                )
+            return jsonify({
+                "type": "error",
+                "error": {"type": "api_error",
+                          "message": f"Upstream error {upstream_resp.status_code}: {translated}",
+                          "failure_class": failure_class},
             }), upstream_resp.status_code
 
         if body.get("stream", False):
@@ -1754,42 +1812,6 @@ def api_login_callback():
     })
 
 
-@app.route("/api/test-chat", methods=["POST"])
-def api_test_chat():
-    """Test chat from UI — returns response text."""
-    body = request.get_json(force=True)
-    model = body.get("model", "glm-5.2")
-    message = body.get("message", "Hello!")
-    stream = body.get("stream", False)
-
-    # Forward to our own /v1/chat/completions
-    import requests as r
-    try:
-        resp = r.post(
-            f"http://127.0.0.1:{PROXY_PORT}/v1/chat/completions",
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": message}],
-                "stream": False,
-            },
-            timeout=600,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            usage = data.get("usage", {})
-            return jsonify({
-                "success": True,
-                "content": content,
-                "model": data.get("model"),
-                "usage": usage,
-            })
-        else:
-            return jsonify({"error": resp.json()}), resp.status_code
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/api/wallet/<email>", methods=["GET"])
 def api_wallet_email(email=None):
     """Check wallet for specific account by email."""
@@ -1849,6 +1871,137 @@ def _dashboard_health_mini():
         return {}
 
 
+@app.route("/api/models", methods=["GET"])
+def api_models():
+    """Model catalog for the dashboard ModelPicker (v2.6.1).
+
+    Read surface, guarded like /api/dashboard/state. Returns:
+      models   — every client-facing alias with routing metadata:
+                 glm aliases (MODEL_MAP + upstream + output cap) and
+                 claude-* aliases (credit-tier routed, with the tier's
+                 CURRENT upstream target from the live resolver)
+      tiers    — {tiers, source, last_refresh} from credit_tiers
+      endpoints— which wire formats each alias accepts
+    """
+    guard = _dash_guard(mutating=False)
+    if guard is not None:
+        return guard
+
+    tier_status = credit_tiers.get_tier_status()
+    tier_map = tier_status.get("tiers", {})
+    alias_tier = {"claude-opus": ("high", "High"),
+                  "claude-sonnet": ("medium", "Medium"),
+                  "claude-haiku": ("low", "Low")}
+
+    models = []
+    for alias, upstream in MODEL_MAP.items():
+        models.append({
+            "id": alias,
+            "family": "glm",
+            "upstream": upstream,
+            "max_output": OUTPUT_CAPS.get(upstream, OUTPUT_CAPS["default"]),
+            "endpoints": ["openai", "anthropic"],
+        })
+    for prefix, (tier_key, tier_label) in alias_tier.items():
+        target = tier_map.get(tier_key, "")
+        models.append({
+            "id": f"{prefix}-latest",
+            "family": "claude",
+            "tier": tier_key,
+            "tier_label": tier_label,
+            "upstream": target,
+            "max_output": OUTPUT_CAPS.get(target, OUTPUT_CAPS["default"]) if target else None,
+            "endpoints": ["openai", "anthropic"],
+        })
+    return jsonify({
+        "models": models,
+        "tiers": tier_status,
+        "default_model": DEFAULT_MODEL,
+    })
+
+
+@app.route("/api/test-chat", methods=["POST"])
+def api_test_chat():
+    """Test chat from UI — returns response text.
+
+    v2.6.1: body may carry {"endpoint": "openai"|"anthropic"} (default
+    openai). The anthropic path drives our own /v1/messages so the
+    dashboard ModelPicker exercises the exact Anthropic wire (conversion,
+    credit-tier routing, banner, clamping) — not a reimplementation.
+    """
+    body = request.get_json(force=True)
+    model = body.get("model", "glm-5.2")
+    message = body.get("message", "Hello!")
+    stream = body.get("stream", False)
+    endpoint = body.get("endpoint", "openai")
+
+    # Forward to our own endpoint (loopback self-call). v2.6.1: the inner
+    # call must satisfy the same API-key gate as external clients — with a
+    # key configured the keyless loopback 401'd (live-verified). The key
+    # never leaves the process; without a key nothing is attached.
+    import requests as r
+    inner_headers = {}
+    if PROXY_API_KEY:
+        inner_headers["Authorization"] = f"Bearer {PROXY_API_KEY}"
+    try:
+        if endpoint == "anthropic":
+            resp = r.post(
+                f"http://127.0.0.1:{PROXY_PORT}/v1/messages",
+                json={
+                    "model": model,
+                    "max_tokens": 1024,
+                    "stream": False,
+                    "messages": [{"role": "user", "content": message}],
+                },
+                headers=inner_headers,
+                timeout=600,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                # Anthropic content blocks -> flat text
+                text = "".join(
+                    b.get("text", "") for b in data.get("content", [])
+                    if isinstance(b, dict) and b.get("type") == "text")
+                usage = data.get("usage", {})
+                return jsonify({
+                    "success": True,
+                    "endpoint": "anthropic",
+                    "content": text,
+                    "model": data.get("model"),
+                    "stop_reason": data.get("stop_reason"),
+                    "usage": usage,
+                })
+            return jsonify({"error": resp.json().get("error", resp.json()),
+                            "endpoint": "anthropic"}), resp.status_code
+
+        resp = r.post(
+            f"http://127.0.0.1:{PROXY_PORT}/v1/chat/completions",
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": message}],
+                "stream": False,
+            },
+            headers=inner_headers,
+            timeout=600,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            usage = data.get("usage", {})
+            return jsonify({
+                "success": True,
+                "endpoint": "openai",
+                "content": content,
+                "model": data.get("model"),
+                "usage": usage,
+            })
+        err_body = resp.json()
+        return jsonify({"error": err_body.get("error", err_body),
+                        "endpoint": "openai"}), resp.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/dashboard/state", methods=["GET"])
 def dashboard_state():
     """Full metrics snapshot (REST fallback for the WebSocket stream).
@@ -1862,6 +2015,9 @@ def dashboard_state():
     snap = metrics.snapshot()
     snap["health_mini"] = _dashboard_health_mini()
     snap["dsml"] = dsml_shim.stats()  # Phase-3.1: DSML real-world panel
+    # v2.6.1: credit-tier status — feeds the dashboard ModelPicker badges
+    # (claude-opus -> High, claude-sonnet -> Medium, claude-haiku -> Low)
+    snap["credit_tiers"] = credit_tiers.get_tier_status()
     return jsonify(snap)
 
 
@@ -2211,6 +2367,14 @@ if _sock is not None:
 
 
 if __name__ == "__main__":
+    # v2.6.1: dev/standalone runs used to emit NO app logs (no handler →
+    # INFO dropped by lastResort at WARNING) — routing evidence invisible
+    # to smoke tests. Gunicorn path configures its own logging.
+    import logging as _logging
+    _lvl = os.environ.get("AUTOCLAW_LOG_LEVEL", "INFO").upper()
+    _logging.basicConfig(
+        level=getattr(_logging, _lvl, _logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logger.info(f"AutoClaw Proxy starting on {PROXY_HOST}:{PROXY_PORT}")
     logger.info(f"Dashboard (React): http://localhost:{PROXY_PORT}/dashboard")
     logger.info(f"Dashboard (classic): http://localhost:{PROXY_PORT}")
@@ -2235,6 +2399,13 @@ if __name__ == "__main__":
     wallet_thread = threading.Thread(target=_bg_wallet_checker, daemon=True)
     wallet_thread.start()
     logger.info(f"Background wallet checker started (interval={_EXHAUSTED_CACHE_TTL}s)")
+
+    # Synergy 7 (v2.6.1 fix): start the credit-tier background refresher.
+    # v2.6.0 shipped the resolver but never started it — tiers stayed
+    # heuristic forever (caught by the live /v1/messages smoke test).
+    credit_tiers.start_background_refresh()
+    logger.info("Credit-tier background refresher started "
+                f"(interval={credit_tiers.TIER_REFRESH_INTERVAL}s)")
 
     # Start OAuth callback server on port 18432 in background thread
     # (Google registered redirect_uri = localhost:18432)

@@ -2839,3 +2839,250 @@ class TestCreditTierRouting:
             "messages": [{"role": "user", "content": "!router help"}]})
         content = r.get_json()["choices"][0]["message"]["content"]
         assert "!router tiers" in content
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# v2.6.1 — live smoke-test findings hardened into offline regression tests
+# (WAF UA block, creditConsumptionLevel extraction, negative-cache marking
+# on /v1/messages, /api/models + /api/test-chat picker surface)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestCreditLevelExtraction:
+    """credit_tiers._extract_tiers against the REAL remote payload shape.
+
+    Live-probed 2026-09-21: the model-config payload carries
+    creditConsumptionLevel: "Low" | "High" | "中" — the original extractor
+    read m['credits']/m['tier'] (fields the payload does not carry), so
+    remote extraction silently degraded to heuristics forever.
+    """
+
+    LIVE_PAYLOAD = {
+        "models": [
+            {"id": "zai_auto", "creditConsumptionLevel": "Low"},
+            {"id": "zai_auto-fast", "creditConsumptionLevel": "中"},
+            {"id": "zaicoding_glm-5.3", "creditConsumptionLevel": "High"},
+            {"id": "tdpsk_deepseek-v4-pro-202606", "creditConsumptionLevel": "Low"},
+        ],
+    }
+
+    def test_live_payload_shape(self):
+        tiers = credit_tiers.CreditTierResolver._extract_tiers(self.LIVE_PAYLOAD)
+        assert tiers == {"high": "zaicoding_glm-5.3",
+                         "medium": "zai_auto-fast",
+                         "low": "zai_auto"}
+
+    def test_normalize_level_vocabulary(self):
+        n = credit_tiers.CreditTierResolver._normalize_level
+        assert n("Low") == "low" and n("LOW") == "low" and n(" 低 ") == "low"
+        assert n("High") == "high" and n("高") == "high"
+        assert n("中") == "medium" and n("Medium") == "medium" and n("中等") == "medium"
+        assert n("") is False or n("") == ""
+        assert n(None) == "" and n(5) == ""
+
+    def test_legacy_fields_still_fallback(self):
+        tiers = credit_tiers.CreditTierResolver._extract_tiers({
+            "models": [{"id": "m-opus", "credits": "high"},
+                       {"id": "m-mid", "tier": "Medium"},
+                       {"id": "m-cheap", "credits": "low"}]})
+        assert tiers == {"high": "m-opus", "medium": "m-mid", "low": "m-cheap"}
+
+    def test_name_heuristics_when_no_level_field(self):
+        tiers = credit_tiers.CreditTierResolver._extract_tiers({
+            "models": [{"id": "something-opus"}, {"id": "glm-turbo"},
+                       {"id": "other-model"}]})
+        assert tiers == {"high": "something-opus", "medium": "other-model",
+                         "low": "glm-turbo"}
+
+    def test_resolution_after_remote_update(self):
+        """Resolver _tiers updated with live payload -> claude aliases route
+        to the live tier targets (zaicoding_glm-5.3 / zai_auto-fast / zai_auto)."""
+        from credit_tiers import _resolver
+        old = dict(_resolver._tiers)
+        try:
+            tiers = credit_tiers.CreditTierResolver._extract_tiers(self.LIVE_PAYLOAD)
+            with _resolver._lock:
+                _resolver._tiers.update(tiers)
+            m, a = credit_tiers.resolve_claude_alias("claude-opus-4-6")
+            assert a and m == "zaicoding_glm-5.3"
+            m, a = credit_tiers.resolve_claude_alias("claude-sonnet-4-5")
+            assert a and m == "zai_auto-fast"
+            m, a = credit_tiers.resolve_claude_alias("claude-haiku-4")
+            assert a and m == "zai_auto"
+        finally:
+            with _resolver._lock:
+                _resolver._tiers.clear()
+                _resolver._tiers.update(old)
+
+
+class TestModelPickerSurface:
+    """v2.6.1: /api/models catalog + /api/test-chat endpoint switch."""
+
+    def test_api_models_lists_claude_aliases(self, client, flask_env):
+        r = client.get("/api/models")
+        assert r.status_code == 200
+        data = r.get_json()
+        ids = [m["id"] for m in data["models"]]
+        for alias in ("claude-opus-latest", "claude-sonnet-latest",
+                      "claude-haiku-latest"):
+            assert alias in ids
+        claude = [m for m in data["models"] if m["family"] == "claude"]
+        assert all(m["tier"] in ("high", "medium", "low") for m in claude)
+        assert all(m["tier_label"] for m in claude)
+        # tier targets present (heuristic at minimum) + tier status block
+        assert data["tiers"]["source"] in ("heuristic", "remote")
+        assert set(data["tiers"]["tiers"].keys()) == {"high", "medium", "low"}
+        # glm family carries routing metadata
+        glm = [m for m in data["models"] if m["family"] == "glm"]
+        assert glm and all(m["upstream"] and m["max_output"] for m in glm)
+
+    def test_api_models_guarded_when_key_set(self, client, flask_env, monkeypatch):
+        monkeypatch.setattr("config.PROXY_API_KEY", "sk-test")
+        monkeypatch.setattr(flask_env, "PROXY_API_KEY", "sk-test")
+        r = client.get("/api/models")
+        assert r.status_code == 401
+        r = client.get("/api/models", headers={"Authorization": "Bearer sk-test"})
+        assert r.status_code == 200
+
+    def test_api_test_chat_openai_shape(self, client, flask_env, monkeypatch):
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            def __init__(self):
+                self._data = {"choices": [{"message": {"content": "pong"}}],
+                              "model": "glm-5-turbo", "usage": {"total_tokens": 1}}
+            def json(self):
+                return self._data
+
+        def fake_post(url, **kw):
+            captured["url"] = url
+            captured["body"] = kw.get("json")
+            return _Resp()
+
+        monkeypatch.setattr("requests.post", fake_post)
+        r = client.post("/api/test-chat",
+                        json={"model": "glm-5-turbo", "message": "ping"})
+        assert r.status_code == 200
+        data = r.get_json()
+        assert data["success"] and data["content"] == "pong"
+        assert data["endpoint"] == "openai"
+        assert captured["url"].endswith("/v1/chat/completions")
+
+    def test_api_test_chat_anthropic_shape(self, client, flask_env, monkeypatch):
+        """endpoint=anthropic must drive OUR /v1/messages (loopback), not a
+        reimplementation — the picker probes the exact client wire."""
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            def __init__(self):
+                self._data = {"model": "claude-haiku-latest",
+                              "stop_reason": "end_turn",
+                              "content": [{"type": "text", "text": "hello"}],
+                              "usage": {"input_tokens": 3, "output_tokens": 1}}
+            def json(self):
+                return self._data
+
+        def fake_post(url, **kw):
+            captured["url"] = url
+            captured["body"] = kw.get("json")
+            return _Resp()
+
+        monkeypatch.setattr("requests.post", fake_post)
+        r = client.post("/api/test-chat",
+                        json={"model": "claude-haiku-latest",
+                              "message": "hi", "endpoint": "anthropic"})
+        assert r.status_code == 200
+        data = r.get_json()
+        assert data["success"] and data["content"] == "hello"
+        assert data["endpoint"] == "anthropic"
+        assert data["stop_reason"] == "end_turn"
+        assert captured["url"].endswith("/v1/messages")
+        # anthropic wire body: max_tokens + messages (no 'stream' flag)
+        assert captured["body"]["max_tokens"] == 1024
+        assert captured["body"]["messages"][0]["role"] == "user"
+
+    def test_api_test_chat_error_passthrough(self, client, flask_env, monkeypatch):
+        class _Resp:
+            status_code = 401
+            def json(self):
+                return {"error": {"message": "No valid tokens"}}
+
+        captured = {}
+        def fake_post(url, **kw):
+            captured["headers"] = kw.get("headers") or {}
+            return _Resp()
+
+        monkeypatch.setattr("requests.post", fake_post)
+        # with a key configured, the loopback self-call must authenticate
+        # itself (v2.6.1: keyless loopback 401'd against the inner endpoint)
+        monkeypatch.setattr("config.PROXY_API_KEY", "sk-test")
+        monkeypatch.setattr(flask_env, "PROXY_API_KEY", "sk-test")
+        r = client.post("/api/test-chat",
+                        json={"model": "glm-5-turbo", "message": "x"})
+        assert r.status_code == 401
+        assert "No valid tokens" in r.get_json()["error"]["message"]
+        assert captured["headers"].get("Authorization") == "Bearer sk-test"
+
+
+class TestAnthropicNegativeCache:
+    """v2.6.1: /v1/messages must classify + mark permanent failures like
+    the OpenAI endpoint — the live smoke test caught doomed upstream
+    requests being replayed on every Anthropic call."""
+
+    def test_401_marks_then_429(self, client, flask_env, monkeypatch):
+        from cache import is_permanent_failure_cached
+        monkeypatch.setattr(flask_env.req_lib, "post",
+                            lambda *a, **kw: FakeRequestsSSE(401, [b'{"error":"Invalid token"}']))
+        r1 = client.post("/v1/messages", json={
+            "model": "glm-5-turbo", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert r1.status_code == 401
+        err = r1.get_json()["error"]
+        assert err["failure_class"] == "auth_failed"
+        # the (model, account) pair is now negatively cached
+        assert is_permanent_failure_cached("zai_glm-5-turbo", "t@x")
+        # second call short-circuits with 429 — never forwarded upstream
+        r2 = client.post("/v1/messages", json={
+            "model": "glm-5-turbo", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi again"}]})
+        assert r2.status_code == 429
+        assert "cached permanent failure" in r2.get_json()["error"]["message"]
+
+    def test_unclassified_status_not_cached(self, client, flask_env, monkeypatch):
+        from cache import is_permanent_failure_cached
+        monkeypatch.setattr(flask_env.req_lib, "post",
+                            lambda *a, **kw: FakeRequestsSSE(500, [b"boom"]))
+        r = client.post("/v1/messages", json={
+            "model": "glm-5-turbo", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 500
+        assert r.get_json()["error"]["failure_class"] is None
+        assert not is_permanent_failure_cached("zai_glm-5-turbo", "t@x")
+
+
+class TestUpstreamUserAgent:
+    """v2.6.1: the edge WAF 405-blocks python-requests/* User-Agents with
+    an HTML challenge — every signed upstream request must carry the
+    desktop UA (live-probed 2026-09-21, see scripts/smoke_test_messages_live.py)."""
+
+    def test_sign_headers_carry_ua(self):
+        import proxy as _p
+        h = _p._sign_headers()
+        ua = h.get("User-Agent", "")
+        assert ua and "python-requests" not in ua
+        assert "Mozilla/5.0" in ua or "autoclaw" in ua or "okhttp" in ua
+
+    def test_auth_sign_headers_carry_ua(self):
+        import auth as _a
+        h = _a._sign_headers()
+        ua = h.get("User-Agent", "")
+        assert ua and "python-requests" not in ua
+
+    def test_config_upstream_ua_override(self, monkeypatch):
+        monkeypatch.setenv("AUTOCLAW_UPSTREAM_UA", "test-agent/1.0")
+        import importlib, config
+        importlib.reload(config)
+        assert config.UPSTREAM_UA == "test-agent/1.0"
+        importlib.reload(config)  # restore for downstream tests

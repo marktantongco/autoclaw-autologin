@@ -136,4 +136,35 @@ table.log td { border-bottom: 1px solid rgba(35,44,56,.55); padding: 5px 8px; }
 .banner code { font-family: var(--mono); color: var(--via); font-size: 11.5px; }
 .banner.warn { border-left-color: var(--warn); color: var(--warn); }
 .banner.info { border-left-color: var(--via); color: var(--dim); }
+
+/* ── v2.6.1: Model picker + live chat probe (Synergy 7 surface) ────── */
+.picker { margin-bottom: 14px; }
+.picker .hint { display: inline-flex; gap: 6px; align-items: center; margin-left: 8px; }
+.linkish { background: none; border: 0; color: var(--via); cursor: pointer;
+  font: inherit; padding: 0; text-decoration: underline; }
+.picker-row { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+.picker-select { flex: 1 1 320px; background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; color: var(--text); padding: 9px 11px; font-size: 13px;
+  font-family: var(--mono); outline: none; }
+.picker-select:focus { border-color: var(--accent); }
+.picker-input { flex: 1 1 320px; background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; color: var(--text); padding: 9px 11px; font-size: 13px; outline: none; }
+.picker-input:focus { border-color: var(--accent); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg-btn { background: var(--panel-2); color: var(--dim); border: 0; padding: 8px 12px;
+  font-size: 12px; font-family: var(--mono); cursor: pointer; }
+.seg-btn + .seg-btn { border-left: 1px solid var(--line); }
+.seg-btn.active { color: var(--accent); background: rgba(56,224,168,.07); }
+.picker-meta { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+.picker-result { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 12px; background: var(--panel-2); }
+.picker-result.ok { border-color: rgba(56,224,168,.35); }
+.picker-result.bad { border-color: rgba(240,106,106,.4); }
+.picker-result-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.picker-text { margin-top: 8px; font-size: 13px; line-height: 1.5; white-space: pre-wrap;
+  word-break: break-word; max-height: 220px; overflow: auto; }
+.picker-usage { margin-top: 6px; }
+.tier-high { color: var(--bad); }
+.tier-med { color: var(--warn); }
+.tier-low { color: var(--accent); }
 .control-disabled { opacity: .55; }

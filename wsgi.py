@@ -22,6 +22,7 @@ if _autoclaw_dir not in sys.path:
 
 from proxy import app  # noqa: E402
 import metrics  # noqa: E402
+import credit_tiers  # noqa: E402
 
 # Phase-3.1: restore persisted telemetry + start flusher (gunicorn preload
 # path; single-worker guidance in gunicorn_config.py — multi-worker metric
@@ -30,6 +31,11 @@ if metrics.init():
     import logging
     logging.getLogger("autoclaw.metrics").info(
         "Dashboard telemetry restored from metrics_state.json")
+
+# v2.6.1 (Synergy 7 fix): the credit-tier refresher must also run under
+# gunicorn — v2.6.0 only wired it into nothing at all (heuristic tiers
+# forever). Daemon thread, 5-min interval, one GET per worker: benign.
+credit_tiers.start_background_refresh()
 
 if __name__ == "__main__":
     # Development fallback: run with Flask dev server

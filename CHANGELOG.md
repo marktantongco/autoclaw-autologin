@@ -1,5 +1,78 @@
 # Changelog
 
+## v2.6.1 — Live Smoke-Test Hardening + Dashboard Model Picker (2026-09-21)
+
+**Scope:** drive `/v1/messages` against the REAL upstream edge with an
+imported token (`scripts/smoke_test_messages_live.py`, 14 stages), fix
+every defect the live probe surfaced, and expose the claude-* credit-tier
+aliases in the React dashboard via a new model picker + live probe panel.
+234/234 offline tests (219 + 15 new).
+
+### Fixed (all found live by the smoke test)
+
+- **Edge WAF blocked every upstream call** — the autoglm-api edge now
+  405-blocks `python-requests/*` (and empty) User-Agents with an HTML
+  challenge page; only standard client UAs reach the auth middleware.
+  Every signed request (proxy + auth + credit-tier refresher) now carries
+  a desktop UA (`config.UPSTREAM_UA`, env-overridable via
+  `AUTOCLAW_UPSTREAM_UA`). Symptom was a 405 HTML page where a JSON auth
+  verdict belonged.
+- **`/v1/messages` skipped the permanent-failure negative cache** — the
+  OpenAI endpoint classifies + marks doomed responses; the Anthropic
+  endpoint replayed them every call. Now mirrors the classifier
+  (auth_failed / model_not_found / quota_exhausted / account_banned) and
+  returns 429 from cache on repeat.
+- **Credit-tier background refresher never started** — v2.6.0 shipped the
+  resolver but nothing called `start_background_refresh()`; tiers stayed
+  heuristic forever. Wired into both entrypoints (`proxy.__main__` and
+  `wsgi`).
+- **Remote tier extraction read the wrong field** — the live
+  model-config payload carries `creditConsumptionLevel`
+  (`"Low"`/`"High"`/`"中"`); the extractor read `credits`/`tier`. Now
+  normalized (incl. CJK 低/中/高) with legacy-field + name-heuristic
+  fallbacks. Live tiers today: high → `zaicoding_glm-5.3`,
+  medium → `zai_auto-fast`, low → `zai_auto`.
+- **`/v1/messages` bypassed the tiered egress chain** — it hard-coded a
+  direct `requests.post`; the owl → thermoptic → direct → ws-local-agent
+  chain is now a shared `_egress_chat_post()` used by both endpoints.
+- **Dev-server runs emitted no app logs** — no logging handler was
+  configured outside gunicorn, so routing evidence was invisible;
+  `basicConfig` now honors `AUTOCLAW_LOG_LEVEL` (default INFO).
+
+### Added
+
+- **Dashboard Model picker + live probe panel** — new `/api/models`
+  catalog (glm family with output caps + claude-* aliases with tier
+  labels and their CURRENT upstream targets) rendered by
+  `dashboard/src/components/ModelPicker.jsx`; the probe fires through
+  `/api/test-chat` (now endpoint-switchable openai | anthropic) which
+  loopbacks into the exact client wire — banner, clamping, negative
+  cache and all. Telemetry: `/api/dashboard/state` now embeds
+  `credit_tiers` (source + targets) for the picker badges.
+- **LIVE smoke test** — `scripts/smoke_test_messages_live.py`: real
+  proxy boot, token import over the live API (real credential file via
+  `--token-file`, or a structural probe JWT), then the full
+  /v1/messages battery against the real edge: auth gate, count_tokens,
+  non-stream GLM alias, claude-* tier routing, negative-cache replay,
+  Anthropic SSE sequence, in-chat !router, telemetry counters, remote
+  tier refresh. Accepts the real upstream verdict as the result:
+  with the probe JWT the edge's `401 {"error":"Invalid token"}`
+  (auth middleware answer) is the pass criterion; with a real token the
+  success path asserts. 14/14 stages pass as of 2026-09-21.
+
+### Output caps
+
+- `zaicoding_glm-5.3` → 307200 and `zai_auto-fast` → 131072 (live
+  maxTokens 393216, capped at the GLM probe threshold — DeepSeek-backed
+  auto-routing per upstream metadata), `tdpsk_deepseek-v4-pro-202606`
+  → 32768 (aggressive, same rationale as zai_auto).
+
+### Env
+
+- `AUTOCLAW_UPSTREAM_UA` — override the desktop UA if the edge
+  fingerprint changes (default mimics the AutoClaw Electron profile).
+- `AUTOCLAW_LOG_LEVEL` — dev-server log verbosity (default INFO).
+
 ## v2.6.0 — Anthropic Messages Endpoint + Claude Credit-Tier Routing (2026-09-21)
 
 **Scope:** the two remaining research-synergy gaps from the 9-repo

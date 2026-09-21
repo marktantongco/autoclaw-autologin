@@ -33,6 +33,21 @@ TOKENS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.j
 # Set AUTOCLAW_TLS_VERIFY=true to enable (recommended for production)
 TLS_VERIFY = os.environ.get("AUTOCLAW_TLS_VERIFY", "false").lower() == "true"
 
+# ── Upstream User-Agent (edge WAF) ──
+# LIVE-PROBED 2026-09-21 (smoke test scripts/smoke_test_messages_live.py):
+# the autoglm-api edge WAF now 405-blocks requests whose User-Agent is
+# python-requests/* (or absent) with an HTML challenge page, while ANY
+# standard client UA (chrome / electron / okhttp / curl) reaches the auth
+# middleware and gets the real JSON verdict (401 {"error":"Invalid token"}
+# for bogus tokens). Default below mimics the AutoClaw desktop (Electron)
+# profile; override with AUTOCLAW_UPSTREAM_UA if the app fingerprint moves.
+UPSTREAM_UA = os.environ.get(
+    "AUTOCLAW_UPSTREAM_UA",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) autoclaw/2.5.0 Chrome/120.0.0.0 Electron/28.0.0 "
+    "Safari/537.36",
+)
+
 # ── Proxy Server ──
 PROXY_HOST = os.environ.get("AUTOCLAW_PROXY_HOST", "127.0.0.1")  # Default localhost (security: was 0.0.0.0)
 PROXY_PORT = int(os.environ.get("AUTOCLAW_PROXY_PORT", "31000"))
@@ -137,6 +152,14 @@ OUTPUT_CAPS = {
                                       # prevent billing surprise when "auto" alias
                                       # is used (it always routes to DeepSeek)
     "zai_glm-5": 131072,             # GLM-5 — same family as 5.2
+    # v2.6.1 — models discovered in the live model-config payload
+    # (probed 2026-09-21; upstream maxTokens → conservative caps):
+    "zaicoding_glm-5.3": 307200,     # GLM-5.3 coding — live maxTokens 307200
+    "zai_auto-fast": 131072,         # live maxTokens 393216, capped at the
+                                      # GLM probe threshold (DeepSeek-backed
+                                      # auto-routing per upstream metadata)
+    "tdpsk_deepseek-v4-pro-202606": 32768,  # explicit DeepSeek variant —
+                                      # same aggressive billing cap as zai_auto
     "default": 65536,                 # Unknown model — be safe
 }
 

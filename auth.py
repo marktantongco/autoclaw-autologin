@@ -68,6 +68,7 @@ def _proxies(proxy):
 
 def _sign_headers():
     """Generate forgeable app-signing headers."""
+    from config import UPSTREAM_UA  # v2.6.1: edge WAF 405s python-requests UA
     ts = str(int(time.time()))
     sign = hashlib.md5(f"{APP_ID}&{ts}&{APP_KEY}".encode()).hexdigest()
     return {
@@ -79,6 +80,7 @@ def _sign_headers():
         "X-Tm": PLATFORM,
         "X-Trace-Id": str(uuid.uuid4()),
         "Content-Type": "application/json",
+        "User-Agent": UPSTREAM_UA,
     }
 
 

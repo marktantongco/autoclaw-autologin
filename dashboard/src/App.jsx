@@ -6,6 +6,7 @@ import RequestLog from "./components/RequestLog.jsx";
 import ClientList from "./components/ClientList.jsx";
 import ControlPanel from "./components/ControlPanel.jsx";
 import DSMLPanel from "./components/DSMLPanel.jsx";
+import ModelPicker from "./components/ModelPicker.jsx";
 import LoginCard from "./components/LoginCard.jsx";
 
 /** Compact counter formatting: 1.2k / 3.4M (Phase-3.1, 8-b W16). */
@@ -272,6 +273,8 @@ export default function App() {
       </section>
 
       <DSMLPanel dsml={data.dsml} featureModels={data.feature_models} />
+
+      <ModelPicker />
 
       <section className="grid-2">
         <div className="panel">
