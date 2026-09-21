@@ -2329,6 +2329,75 @@ class TestTokenImport:
         assert out["files"] == 2 and out["imported"] == 1
         assert out["errors"] and "bad.json" in out["errors"][0]
 
+    def test_consume_directory_archives(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ACLAW_IMPORT_STABLE", "0")
+        token_import.reset()
+        d = tmp_path / "wd"; d.mkdir()
+        (d / "acc1.json").write_text(json.dumps(
+            {"email": "wd1@x", "access_token": "a",
+             "refresh_token": "r", "device_id": "d"}))
+        (d / "bad.json").write_text("{broken", encoding="utf-8")
+        (d / "notjson.txt").write_text("skip me", encoding="utf-8")
+        out = token_import.consume_directory(str(d))
+        assert out["files"] == 2 and out["imported"] == 1
+        assert out["processed"] == 1 and out["failed"] == 1
+        assert not list(d.glob("*.json"))  # queue drained — drop disappears
+        assert (d / "processed" / "acc1.json").exists()
+        assert (d / "failed" / "bad.json").exists()
+
+    def test_consume_directory_skip_unchanged(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ACLAW_IMPORT_STABLE", "0")
+        token_import.reset()
+        d = tmp_path / "wd"; d.mkdir()
+        (d / "acc1.json").write_text(json.dumps(
+            {"email": "wd3@x", "access_token": "a",
+             "refresh_token": "r", "device_id": "d"}))
+        # archive failure (e.g. read-only dir): records are ingested once,
+        # the file stays, and later passes must NOT re-ingest it
+        monkeypatch.setattr(token_import, "_archive",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                OSError("read-only")))
+        out1 = token_import.consume_directory(str(d))
+        assert out1["imported"] == 1 and out1["processed"] == 0
+        assert out1["errors"] and "archive failed" in out1["errors"][0]
+        out2 = token_import.consume_directory(str(d))
+        assert out2["files"] == 0 and out2["skipped"] == 1
+        # a content change (new mtime/size) IS re-consumed
+        (d / "acc1.json").write_text(json.dumps(
+            {"email": "wd3@x", "access_token": "a2",
+             "refresh_token": "r", "device_id": "d"}))
+        out3 = token_import.consume_directory(str(d))
+        assert out3["files"] == 1 and out3["updated"] == 1
+
+    def test_consume_directory_stability_window(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("ACLAW_IMPORT_STABLE", "30")
+        token_import.reset()
+        d = tmp_path / "wd"; d.mkdir()
+        (d / "fresh.json").write_text(json.dumps(
+            {"email": "wd4@x", "access_token": "a",
+             "refresh_token": "r", "device_id": "d"}))
+        out = token_import.consume_directory(str(d))
+        assert out["files"] == 0 and out["skipped"] == 1
+        assert (d / "fresh.json").exists()  # left for the next pass
+
+    def test_poll_interval_parsing(self, monkeypatch):
+        monkeypatch.setenv("ACLAW_IMPORT_POLL", "0")
+        assert token_import.poll_interval() == 0.0
+        monkeypatch.setenv("ACLAW_IMPORT_POLL", "7")
+        assert token_import.poll_interval() == 7.0
+        monkeypatch.setenv("ACLAW_IMPORT_POLL", "bogus")
+        assert token_import.poll_interval() == 20.0
+        monkeypatch.delenv("ACLAW_IMPORT_POLL")
+        assert token_import.poll_interval() == 20.0
+
+    def test_stats_reports_watchdog_block(self, monkeypatch):
+        token_import.reset()
+        monkeypatch.delenv("ACLAW_IMPORT_POLL", raising=False)
+        st = token_import.stats()
+        assert st["watchdog"]["interval_s"] == 20.0
+        assert st["watchdog"]["running"] is False
+        assert st["watchdog"]["passes"] == 0
+
     def test_oauth_mode_resolution(self, monkeypatch):
         monkeypatch.setenv("ACLAW_OAUTH_MODE", "import")
         assert token_import.oauth_mode() == "import"

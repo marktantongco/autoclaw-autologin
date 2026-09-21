@@ -1676,7 +1676,7 @@ def api_tokens_import_run():
     guard = _import_guard()
     if guard:
         return guard
-    return jsonify(token_import.import_directory())
+    return jsonify(token_import.consume_directory())
 
 
 @app.route("/auth/callback-google")
@@ -2386,14 +2386,16 @@ if __name__ == "__main__":
     if metrics.init():
         logger.info("Dashboard telemetry restored from metrics_state.json")
 
-    # Synergy 7: ingest the token import watch-dir at boot
+    # Synergy 7: ingest the token import watch-dir at boot (v2.6.1: consume
+    # semantics — consumed files archive to processed/ or failed/)
     if os.environ.get("ACLAW_IMPORT_ON_START", "1").strip().lower() not in (
             "0", "false", "no", "off"):
-        imp = token_import.import_directory()
+        imp = token_import.consume_directory()
         if imp.get("files"):
             logger.info(f"Token import: {imp['files']} file(s) -> "
                         f"+{imp['imported']} new, {imp['updated']} updated, "
-                        f"{imp['rejected']} rejected")
+                        f"{imp['rejected']} rejected, "
+                        f"{imp['processed']} processed/, {imp['failed']} failed/")
 
     # Start background wallet checker (every 5 min, non-blocking)
     wallet_thread = threading.Thread(target=_bg_wallet_checker, daemon=True)
@@ -2406,6 +2408,12 @@ if __name__ == "__main__":
     credit_tiers.start_background_refresh()
     logger.info("Credit-tier background refresher started "
                 f"(interval={credit_tiers.TIER_REFRESH_INTERVAL}s)")
+
+    # Synergy 7 (v2.6.2): poll the import watch-dir so desktop batch drops
+    # are ingested without any manual POST (ACLAW_IMPORT_POLL seconds, 0=off)
+    wd = token_import.start_watchdog()
+    logger.info(f"Import watch-dir: dir={os.environ.get('ACLAW_IMPORT_DIR') or '(default .autoclaw_imports)'} "
+                f"poll={wd.get('interval_s', 0):.0f}s active={wd.get('running', False)}")
 
     # Start OAuth callback server on port 18432 in background thread
     # (Google registered redirect_uri = localhost:18432)

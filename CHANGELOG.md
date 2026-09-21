@@ -1,5 +1,49 @@
 # Changelog
 
+## v2.6.2 — CI Supply-Chain Guard + Import Watch-Dir Poller (2026-09-21)
+
+**Scope:** agent-kernel supply-chain hardening and the token-supply
+operational gap left since v2.4.0: drops landing in the import dir sat
+un-ingested until the next restart or a manual POST. Both changes are
+additive; no existing surface changed.
+
+### Added
+
+- **skills-lock CI guard** — `.github/workflows/skills-lock-guard.yml`
+  runs `scripts/gen_skills_lock.py --check` on every PR and every push
+  to main. Any vendored-skill drift fails CI until the lockfile is
+  regenerated — the lockfile diff itself becomes the supply-chain
+  review. The same workflow lints all 15 skill frontmatters
+  (`scripts/audit_skill_triggers.py --lint-only`, folded-scalar aware).
+- **A+C skill kernel, vendored closed set** — `.agents/skills/` carries
+  15 skills from 6 pinned upstream SHAs (102 files), mirrored by
+  `skills-lock.json` (per-skill source / 40-char ref / skillPath /
+  computedHash). Boot cost ~1,163 tokens (frontmatter-only listing).
+  Additions require an eviction decision — see
+  `.agents/skills/VENDORED.md`.
+- **Import watch-dir poller (Synergy 7)** — desktop batch runs can now
+  drop `*.json` token files into `ACLAW_IMPORT_DIR` and walk away:
+  `token_import.start_watchdog()` ingests on an `ACLAW_IMPORT_POLL`
+  interval (default 20 s, `0` = off) with poll-safe semantics:
+  - *skip-unchanged* — mtime_ns+size cache; polling never re-ingests
+    or inflates counters;
+  - *stability window* — files younger than `ACLAW_IMPORT_STABLE`
+    (default 2 s) are left for the next pass (mid-write guard);
+  - *archive contract* — parsed files move to `<dir>/processed/`,
+    unparseable ones to `<dir>/failed/` (collision-safe rename), so a
+    drop disappears exactly when it is consumed and the queue is
+    visible at a glance.
+- Boot hook and `POST /api/tokens/import/run` now share the consume
+  semantics; `/health` and `/api/tokens/import/status` expose a
+  `watchdog` block (interval, passes, consumed_files, last_pass).
+- **AGENTS.md** — session discipline for agent contributors: the
+  user-invoked `/grill-me` gate (SMP Stage-2), kernel re-vendor rules,
+  release discipline.
+
+### Tests
+
+- 234 → 239 (+5): consume/archive contract, skip-unchanged, stability
+  window, poll-interval parsing, watchdog stats block. 0 regressions.
 ## v2.6.1 — Live Smoke-Test Hardening + Dashboard Model Picker (2026-09-21)
 
 **Scope:** drive `/v1/messages` against the REAL upstream edge with an

@@ -34,8 +34,11 @@ What this module is NOT
 Env knobs (config.py mirrors these; see deploy/env.template):
   ACLAW_NO_BROWSER        1|0    master switch: refuse/flag browser flows
   ACLAW_OAUTH_MODE        auto|browser|import|none   governs /api/login-url
-  ACLAW_IMPORT_DIR        path   watch-dir ingested at boot + via API
+  ACLAW_IMPORT_DIR        path   watch-dir ingested at boot + via API + poller
   ACLAW_IMPORT_ON_START   1|0    ingest the dir at boot (default 1)
+  ACLAW_IMPORT_POLL       secs   watch-dir poll interval (default 20; 0 = off)
+  ACLAW_IMPORT_STABLE     secs   skip files younger than this (default 2;
+                                 mid-write guard for batch droppers)
   ACLAW_IMPORT_FORMAT     auto|autoclaw2api|desktop-ls|tokens-json
   ACLAW_IMPORT_DEDUPE     email|refresh_token   merge key (default email)
 """
@@ -318,6 +321,179 @@ def import_directory(path=None):
         return out
 
 
+# ── Watch-dir consumer (v2.6.1): poll + archive semantics ────────────────
+# import_directory() stays the plain "ingest everything" pass (boot + API +
+# tests). consume_directory() adds the three properties a long-running
+# watch-dir needs:
+#   skip      — unchanged files (mtime_ns+size cache) are not re-parsed, so
+#               polling never re-ingests or inflates counters
+#   stability — files modified within ACLAW_IMPORT_STABLE seconds are left
+#               for the next pass (desktop batch writers may be mid-write)
+#   archive   — parsed files move to <dir>/processed/, unparseable ones to
+#               <dir>/failed/: a drop disappears exactly when it is
+#               consumed, so operators can see the queue at a glance
+_WATCH_CACHE = {}   # abspath -> (mtime_ns, size) of last seen state
+_WATCHDOG = {"thread": None, "passes": 0, "last_scan_ts": None,
+             "last_pass": None, "consumed_files": 0}
+_WATCHDOG_STOP = threading.Event()
+
+
+def poll_interval():
+    """Watch-dir poll interval in seconds. ACLAW_IMPORT_POLL, default 20;
+    0 disables the poller. Never raises."""
+    try:
+        v = float(_env("ACLAW_IMPORT_POLL", "20") or 20)
+    except (TypeError, ValueError):
+        v = 20.0
+    return max(0.0, v)
+
+
+def _stable_seconds():
+    try:
+        return max(0.0, float(_env("ACLAW_IMPORT_STABLE", "2") or 0))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+def _archive(fp, dest_dir):
+    """Move a consumed file into dest_dir, collision-safe. Returns new path."""
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, os.path.basename(fp))
+    if os.path.exists(dest):  # same-name re-drop — never clobber evidence
+        stem, ext = os.path.splitext(os.path.basename(fp))
+        dest = os.path.join(dest_dir, f"{stem}.{int(time.time() * 1000)}{ext}")
+    os.replace(fp, dest)
+    return dest
+
+
+def consume_directory(path=None):
+    """One watch-dir pass: ingest new/changed *.json, then archive each file
+    into processed/ (parsed) or failed/ (unparseable). Unchanged and too-fresh
+    files are skipped. Returns a per-pass summary. Never raises."""
+    d = path or _env("ACLAW_IMPORT_DIR",
+                     os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  ".autoclaw_imports"))
+    out = {"dir": d, "files": 0, "skipped": 0, "imported": 0, "updated": 0,
+           "rejected": 0, "processed": 0, "failed": 0, "errors": []}
+    try:
+        if not d or not os.path.isdir(d):
+            return out
+        stable_before = time.time() - _stable_seconds()
+        for fp in sorted(glob.glob(os.path.join(d, "*.json"))):
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue  # vanished mid-pass — next poll
+            key = os.path.abspath(fp)
+            if _WATCH_CACHE.get(key) == (st.st_mtime_ns, st.st_size):
+                out["skipped"] += 1
+                continue
+            if st.st_mtime > stable_before:  # too fresh — writer mid-write
+                out["skipped"] += 1
+                continue
+            _WATCH_CACHE[key] = (st.st_mtime_ns, st.st_size)
+            out["files"] += 1
+            ok_parse = False
+            try:
+                with open(fp, "r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                ok_parse = True
+            except Exception as exc:
+                out["errors"].append(f"{os.path.basename(fp)}: {exc}")
+                with _LOCK:
+                    _STATS["last_error"] = f"{os.path.basename(fp)}: {exc}"
+            if ok_parse:
+                s = import_payload(payload,
+                                   source=f"file:{os.path.basename(fp)}")
+                with _LOCK:
+                    _STATS["files_seen"] += 1
+                out["imported"] += s["imported"]
+                out["updated"] += s["updated"]
+                out["rejected"] += s["rejected"]
+                if s["rejected"]:
+                    out["errors"].append(f"{os.path.basename(fp)}: "
+                                         f"{s['rejected']} record(s) rejected")
+            try:
+                _archive(fp, os.path.join(d,
+                          "processed" if ok_parse else "failed"))
+                out["processed" if ok_parse else "failed"] += 1
+                _WATCH_CACHE.pop(key, None)  # moved — cache entry obsolete
+            except OSError as exc:
+                # keep the cache entry: records were already ingested, so
+                # re-parsing every poll would churn the store — the file is
+                # skipped until its mtime/size actually changes
+                out["errors"].append(f"{os.path.basename(fp)}: "
+                                     f"archive failed: {exc}")
+        return out
+    except Exception as exc:
+        out["errors"].append(str(exc))
+        return out
+
+
+def watchdog_status():
+    """/health-visible watchdog telemetry. Never raises."""
+    try:
+        with _LOCK:
+            t = _WATCHDOG["thread"]
+            return {
+                "interval_s": poll_interval(),
+                "running": bool(t and t.is_alive()),
+                "passes": _WATCHDOG["passes"],
+                "last_scan_ts": _WATCHDOG["last_scan_ts"],
+                "consumed_files": _WATCHDOG["consumed_files"],
+                "last_pass": _WATCHDOG["last_pass"],
+            }
+    except Exception as exc:  # defensive — telemetry must never raise
+        return {"error": str(exc)}
+
+
+def start_watchdog():
+    """Start the watch-dir poller thread (ACLAW_IMPORT_POLL seconds between
+    passes; 0 = disabled). Idempotent. Returns watchdog_status(). Never
+    raises — a poller failure must never take the proxy down."""
+    try:
+        iv = poll_interval()
+        started = False
+        with _LOCK:
+            t = _WATCHDOG["thread"]
+            if not (t and t.is_alive()) and iv > 0:
+                def _loop(interval=iv):
+                    while not _WATCHDOG_STOP.wait(interval):
+                        try:
+                            out = consume_directory()
+                            with _LOCK:
+                                _WATCHDOG["passes"] += 1
+                                _WATCHDOG["last_scan_ts"] = time.time()
+                                _WATCHDOG["last_pass"] = out
+                                _WATCHDOG["consumed_files"] += out["files"]
+                            if out["files"] or out["errors"]:
+                                logger.info(
+                                    "import watch-dir: %d file(s) consumed "
+                                    "(+%d new, %d updated, %d rejected), "
+                                    "%d processed, %d failed%s",
+                                    out["files"], out["imported"],
+                                    out["updated"], out["rejected"],
+                                    out["processed"], out["failed"],
+                                    (" — errors: "
+                                     + "; ".join(out["errors"][:2]))
+                                    if out["errors"] else "")
+                        except Exception:  # defensive — poller must never die
+                            pass
+
+                _WATCHDOG_STOP.clear()
+                t = threading.Thread(target=_loop, daemon=True,
+                                     name="import-watchdog")
+                _WATCHDOG["thread"] = t
+                t.start()
+                started = True
+        if started:
+            logger.info("import watch-dir poller started (interval=%.0fs)", iv)
+        return watchdog_status()  # outside _LOCK — avoids re-entrant deadlock
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.warning("watchdog start failed: %s", exc)
+        return watchdog_status()
+
+
 def note_oauth_upstream(status):
     """Record the live-probed upstream OAuth state (live|405)."""
     try:
@@ -378,11 +554,13 @@ def applogin_probe(force=False):
 def stats():
     """/health token_import block. Never raises."""
     try:
+        wd = watchdog_status()  # outside _LOCK — watchdog_status locks itself
         with _LOCK:
             return {
                 "mode": ("no-browser" if no_browser()
                          else f"oauth:{oauth_mode()}"),
                 "import_dir": _env("ACLAW_IMPORT_DIR", "") or None,
+                "watchdog": wd,
                 "oauth_upstream": _STATS["oauth_upstream"],
                 "records_seen": _STATS["records_seen"],
                 "files_seen": _STATS["files_seen"],
@@ -408,3 +586,7 @@ def reset():
                 _STATS[k] = None
             else:
                 _STATS[k] = 0
+    _WATCH_CACHE.clear()
+    with _LOCK:
+        _WATCHDOG.update({"passes": 0, "last_scan_ts": None,
+                          "last_pass": None, "consumed_files": 0})
