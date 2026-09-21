@@ -1,0 +1,29 @@
+name: skills-lock-guard
+
+# Supply-chain gate: every PR must keep skills-lock.json in sync with the
+# vendored kernel. Hash drift = vendored skill files changed without going
+# through the re-vendor + review flow. The lockfile diff IS the review.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify vendored kernel hashes against skills-lock.json
+        run: python3 scripts/gen_skills_lock.py --check
+
+      - name: Trigger-precision audit (frontmatter lint + probe contracts)
+        run: python3 scripts/audit_skill_triggers.py --lint-only
