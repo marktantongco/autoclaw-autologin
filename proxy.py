@@ -82,6 +82,11 @@ import ws_fallback
 import thermoptic_bridge
 import token_import  # Synergy 7 (Phase-3.1): no-CloakBrowser import mode
 
+# v2.7.0 (Synergy 10): authorized provider adapter channel — NVIDIA NIM.
+# nim/* models bypass the AutoClaw pipeline entirely (operator's own API
+# key, direct TLS-verified egress, native tool calling) — nim_adapter.py.
+import nim_adapter
+
 # ─── Structured Logging ──────────────────────────────────────────────
 logger = logging.getLogger("autoclaw.proxy")
 
@@ -596,6 +601,13 @@ def chat_completions():
     g._model = body.get("model", DEFAULT_MODEL)  # Phase 3: metrics tag
     # Model mapping with strict validation (Audit Fix: silent fallback to expensive model)
     client_model = body.get("model", DEFAULT_MODEL)
+
+    # ── v2.7.0 Synergy 10: NIM channel (authorized provider adapter) ──
+    # nim/* models route to NVIDIA NIM with the operator's own key — they
+    # never touch the AutoClaw token/egress pipeline below.
+    if nim_adapter.is_nim_model(client_model):
+        return nim_adapter.handle_openai_chat(body, g)
+
     # ── v2.6.0 Synergy 7: Claude credit-tier routing ──
     # Source: eequaled/GLM_proxy fetchRemoteModelConfig / resolveTierTargets
     # claude-opus-* -> High, claude-sonnet-* -> Medium, claude-haiku-* -> Low.
@@ -1057,6 +1069,17 @@ def list_models():
             "created": 1700000000,
             "owned_by": "autoclaw-credit-tier",
         })
+    # v2.7.0 (Synergy 10): NVIDIA NIM channel — live catalog when enabled
+    # (NVIDIA_API_KEY set), nothing advertised otherwise.
+    if nim_adapter.enabled():
+        for mid in nim_adapter.list_models_live():
+            models.append({
+                "id": f"nim/{mid}",
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "nvidia-nim",
+                "upstream": mid,
+            })
     return jsonify({"object": "list", "data": models})
 
 
@@ -1098,6 +1121,13 @@ def anthropic_messages():
     client_model = body.get("model", DEFAULT_MODEL)
     g._model = client_model  # metrics tag
     g._wants_stream = bool(body.get("stream", False))
+
+    # ── v2.7.0 Synergy 10: NIM channel (authorized provider adapter) ──
+    # nim/* models bypass credit-tier routing and the AutoClaw pipeline;
+    # the adapter converts Anthropic wire in/out around a native NIM call.
+    if nim_adapter.is_nim_model(client_model):
+        return nim_adapter.handle_anthropic_messages(body, client_model, g)
+
 
     # Credit-tier routing also applies to Anthropic clients (Synergy 7)
     tier_model, is_claude_alias = credit_tiers.resolve_claude_alias(client_model)
@@ -1232,6 +1262,7 @@ def anthropic_messages():
 
         # Non-stream: aggregate upstream SSE -> OpenAI -> Anthropic JSON
         full_content = ""
+        full_reasoning = ""  # v2.7.0: reasoning_content → thinking block
         full_tool_calls = []
         usage = {}
         for line in upstream_resp.iter_lines():
@@ -1250,6 +1281,8 @@ def anthropic_messages():
                     delta = choices[0].get("delta", {})
                     if delta.get("content"):
                         full_content += delta["content"]
+                    if delta.get("reasoning_content"):
+                        full_reasoning += delta["reasoning_content"]
                     for tc in delta.get("tool_calls", []) or []:
                         idx = tc.get("index", 0)
                         while len(full_tool_calls) <= idx:
@@ -1272,6 +1305,7 @@ def anthropic_messages():
                 "message": {
                     "role": "assistant",
                     "content": full_content if full_content else None,
+                    **({"reasoning_content": full_reasoning} if full_reasoning else {}),
                     **({"tool_calls": full_tool_calls} if full_tool_calls else {}),
                 },
                 "finish_reason": "tool_calls" if full_tool_calls else "stop",

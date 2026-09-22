@@ -1,5 +1,61 @@
 # Changelog
 
+## v2.7.0 — Synergy 10: NVIDIA NIM Authorized Provider Adapter (2026-09-22)
+
+**Scope:** first authorized-provider channel in the router. `nim/*` models
+route to NVIDIA NIM (integrate.api.nvidia.com) with the operator's OWN
+`nvapi` key — first-party Bearer auth, direct TLS-verified egress, native
+function-calling. No AutoClaw quirks apply: no token rotation, no system
+banner, no DSML shim, no output-cap clamp, no negative cache, no proxy
+racing. This is the Phase-2 "adapter pattern" deliverable: Anthropic-format
+in, per-provider translation out.
+
+### Added
+
+- **`nim_adapter.py`** — channel module:
+  - Model addressing `nim/<id>` (prefix stripped; NIM ids keep their
+    slashes, e.g. `nim/meta/...` → `meta/...`).
+  - `POST /v1/chat/completions` transparent OpenAI in/out passthrough.
+  - `POST /v1/messages` Anthropic adapter — reuses `anthropic_compat`
+    converters end-to-end (request translation, response shapes, SSE
+    state machine).
+  - `GET /v1/models` live NIM catalog (10-min cache, static fallback;
+    only advertised when `NVIDIA_API_KEY` is set).
+  - NIM error → wire-shape translation (`401→authentication_error`,
+    `404→not_found_error`, `429→rate_limit_error`, …).
+- **`reasoning_content` → Anthropic `thinking` blocks** in
+  `anthropic_compat` (both non-stream and streaming): reasoning deltas
+  open a `thinking` content block before the text block; kind switches
+  close + advance the block index. Works for any OpenAI-compatible
+  upstream that emits reasoning_content (deepseek / nemotron / glm).
+- **Aggregation-path reasoning** — the AutoClaw non-stream aggregate now
+  carries `reasoning_content` through to `thinking` blocks as well.
+- **Env**: `NVIDIA_API_KEY` (enables the channel), `NVIDIA_NIM_BASE_URL`,
+  `NVIDIA_NIM_TIMEOUT` (documented in `deploy/env.template`).
+- **Tests**: `scripts/test-nim-adapter.py` — 36 offline checks (model
+  addressing, passthrough stream/non-stream, error translation, Anthropic
+  adapter stream/non-stream, thinking-block regression guards, disabled
+  channel, request-conversion regression). **`scripts/smoke_test_nim_live.py`
+  — 11-stage live acceptance battery** against the real NIM edge.
+
+### Fixed
+
+- **Streaming contract bug (caught by live smoke):** `anthropic_to_openai`
+  does not carry the `stream` flag — the NIM adapter now sets
+  `openai_body["stream"]` explicitly. Without it, NIM answers non-stream
+  JSON and the SSE converter yields an empty 200.
+
+### Live acceptance (2026-09-22, real nvapi key)
+
+11/11 stages: boot, live catalog (82 models), auth gate, non-stream
+Anthropic shape, full SSE sequence, native tool round-trip
+(`get_weather{"city":"Tokyo"}` → `stop_reason=tool_use`), OpenAI
+passthrough, reasoning `thinking_delta` stream (glm-5.3-flash), 404
+translation, `X-Upstream-Via: nim`. Primary models live-verified:
+`deepseek-ai/deepseek-v4.1-flash`, `nvidia/nemotron-3-super-120b-a12b`,
+`z-ai/glm-5.3-flash` (meta/llama-3.3-70b and deepseek-r1 are EOL upstream
+— do not re-add without a probe).
+
 ## v2.6.2 — CI Supply-Chain Guard + Import Watch-Dir Poller (2026-09-21)
 
 **Scope:** agent-kernel supply-chain hardening and the token-supply

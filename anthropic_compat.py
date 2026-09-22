@@ -185,6 +185,11 @@ def openai_to_anthropic_response(openai_resp: dict, client_model: str) -> dict:
     finish = choice.get("finish_reason", "stop")
 
     content_blocks = []
+    # v2.7.0: OpenAI-compatible upstreams that emit reasoning_content
+    # (deepseek-r1 / nemotron style) surface as Anthropic thinking blocks.
+    if message.get("reasoning_content"):
+        content_blocks.append({"type": "thinking",
+                               "thinking": message["reasoning_content"]})
     if message.get("content"):
         content_blocks.append({"type": "text", "text": message["content"]})
 
@@ -244,8 +249,12 @@ class AnthropicStreamConverter:
         self.input_tokens = 0
         self.output_tokens = 0
         self.block_index = 0
-        # Track open blocks: index -> type ("text" | "tool_use")
+        # Track open blocks: index -> type ("text" | "thinking" | "tool_use")
         self.open_blocks = {}
+        # v2.7.0: currently-open prose block kind (None | "text" | "thinking").
+        # Reasoning and answer text interleave on reasoning upstreams; each
+        # switch closes the open block and advances the block index.
+        self._open_kind = None
         self.tool_call_names = {}  # tool index -> name
         self.message_started = False
         self.finished = False
@@ -294,6 +303,36 @@ class AnthropicStreamConverter:
         del self.open_blocks[index]
         return _sse_event({"type": "content_block_stop", "index": index})
 
+    def _ensure_kind_block(self, kind):
+        """Ensure an open prose block of `kind` ("text" | "thinking").
+
+        v2.7.0: opens the block at self.block_index, closing a different
+        open prose block first (advancing the index). Returns the list of
+        SSE events to emit (content_block_stop + content_block_start, or
+        just the start, or [] when already open).
+        """
+        events = []
+        if self._open_kind == kind and self.block_index in self.open_blocks:
+            return events
+        if (self._open_kind is not None
+                and self.block_index in self.open_blocks):
+            stop_ev = self._close_block(self.block_index)
+            if stop_ev:
+                events.append(stop_ev)
+            self.block_index += 1
+        self._open_kind = kind
+        if kind == "thinking":
+            block = {"type": "thinking", "thinking": ""}
+        else:
+            block = {"type": "text", "text": ""}
+        self.open_blocks[self.block_index] = kind
+        events.append(_sse_event({
+            "type": "content_block_start",
+            "index": self.block_index,
+            "content_block": block,
+        }))
+        return events
+
     def process_chunk(self, chunk: dict):
         """Process one OpenAI chunk; yield Anthropic SSE event strings."""
         events = []
@@ -313,16 +352,23 @@ class AnthropicStreamConverter:
         choice = choices[0]
         delta = choice.get("delta", {})
 
+        # v2.7.0: reasoning content → thinking block (deepseek-r1 style)
+        reasoning = delta.get("reasoning_content")
+        if reasoning:
+            events.extend(self._ensure_kind_block("thinking"))
+            events.append(_sse_event({
+                "type": "content_block_delta",
+                "index": self.block_index,
+                "delta": {"type": "thinking_delta", "thinking": reasoning},
+            }))
+
         # Text content
         text = delta.get("content")
         if text:
-            blk = self.block_index
-            open_ev = self._open_block(blk, "text")
-            if open_ev:
-                events.append(open_ev)
+            events.extend(self._ensure_kind_block("text"))
             events.append(_sse_event({
                 "type": "content_block_delta",
-                "index": blk,
+                "index": self.block_index,
                 "delta": {"type": "text_delta", "text": text},
             }))
 
@@ -376,6 +422,7 @@ class AnthropicStreamConverter:
             }))
             events.append(_sse_event({"type": "message_stop"}))
             self.finished = True
+            self._open_kind = None
 
         return events
 
