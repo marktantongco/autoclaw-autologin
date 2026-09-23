@@ -1,0 +1,65 @@
+{
+  "generated_at": "2026-09-22T03:11:07",
+  "base_url": "http://127.0.0.1:31997",
+  "channel": "nvidia-nim (authorized provider adapter)",
+  "model": "nim/deepseek-ai/deepseek-v4.1-flash",
+  "passed": 11,
+  "total": 11,
+  "results": [
+    {
+      "name": "boot + /health",
+      "ok": true,
+      "detail": "pid=2220 port=31997"
+    },
+    {
+      "name": "NIM channel enabled in /health",
+      "ok": true,
+      "detail": "version=2.7.0 accounts=1"
+    },
+    {
+      "name": "nim/* entries on /v1/models",
+      "ok": true,
+      "detail": "82 nim models, e.g. ['nim/01-ai/yi-large', 'nim/adept/fuyu-8b', 'nim/ai21labs/jamba-1.5-large-instruct']"
+    },
+    {
+      "name": "401 authentication_error without key",
+      "ok": true,
+      "detail": "HTTP 401 type=authentication_error"
+    },
+    {
+      "name": "non-stream 200 + Anthropic shape + 'OK'",
+      "ok": true,
+      "detail": "HTTP 200 in 4.5s text='OK' stop=end_turn usage={'input_tokens': 35, 'output_tokens': 16}"
+    },
+    {
+      "name": "full Anthropic SSE sequence + text deltas",
+      "ok": true,
+      "detail": "events=['message_start', 'content_block_start', 'content_block_delta', 'content_block_delta', 'content_block_delta', 'content_block_delta']… in 4.7s"
+    },
+    {
+      "name": "tool_use block + stop_reason",
+      "ok": true,
+      "detail": "HTTP 200 in 1.4s tool=get_weather input={'city': 'Tokyo'} stop=tool_use"
+    },
+    {
+      "name": "OpenAI shape + content",
+      "ok": true,
+      "detail": "HTTP 200 in 2.7s content='PONG'"
+    },
+    {
+      "name": "thinking block precedes text",
+      "ok": true,
+      "detail": "block kinds=['thinking', 'text'] thinking_deltas=5 events=21"
+    },
+    {
+      "name": "404 → not_found_error (Anthropic shape)",
+      "ok": true,
+      "detail": "HTTP 404 type=not_found_error msg='404 page not found'"
+    },
+    {
+      "name": "X-Upstream-Via: nim",
+      "ok": true,
+      "detail": "header='nim' HTTP 200"
+    }
+  ]
+}
